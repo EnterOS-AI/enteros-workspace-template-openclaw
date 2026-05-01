@@ -56,6 +56,16 @@ class OpenClawAdapter(BaseAdapter):
 
     async def setup(self, config: AdapterConfig) -> None:  # pragma: no cover
         """Install OpenClaw, run onboard, copy workspace files, start gateway."""
+        # Boot-smoke contract (molecule-core#2275): the publish-image gate
+        # invokes us with stub creds + no network so it can exercise lazy
+        # imports inside execute(). Real gateway spawn would fail here
+        # (no valid api_key, no `openclaw` binary on PATH yet), so skip
+        # the heavy setup path entirely. The runtime's smoke_mode short-
+        # circuit fires immediately after create_executor() returns.
+        if os.environ.get("MOLECULE_SMOKE_MODE") == "1":
+            logger.info("MOLECULE_SMOKE_MODE=1 — skipping OpenClaw gateway spawn")
+            return
+
         npm_prefix = os.path.expanduser("~/.local")
         os.environ["PATH"] = f"{npm_prefix}/bin:{os.environ.get('PATH', '')}"
 
