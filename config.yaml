@@ -18,8 +18,6 @@ a2a:
 env:
   required:
   - OPENAI_API_KEY
-skills:
-  - coding-discipline
 template_schema_version: 1
 models:
 - id: openai:gpt-4.1-mini
