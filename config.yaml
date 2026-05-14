@@ -47,3 +47,19 @@ runtime_config:
     name: Claude Sonnet 4.5 (OpenRouter)
     required_env:
     - OPENROUTER_API_KEY
+  - id: minimax:MiniMax-M2.7
+    name: MiniMax M2.7 (MiniMax)
+    required_env:
+    - MINIMAX_API_KEY
+  - id: minimax:MiniMax-M2.7-highspeed
+    name: MiniMax M2.7 Highspeed (MiniMax)
+    required_env:
+    - MINIMAX_API_KEY
+  - id: moonshot:kimi-k2.6
+    name: Kimi K2.6 (Moonshot)
+    required_env:
+    - KIMI_API_KEY
+  - id: moonshot:kimi-k2.5
+    name: Kimi K2.5 (Moonshot)
+    required_env:
+    - KIMI_API_KEY
