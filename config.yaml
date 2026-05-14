@@ -15,20 +15,35 @@ a2a:
   port: 8000
   streaming: true
   push_notifications: true
-env:
-  required:
-  - OPENAI_API_KEY
 template_schema_version: 1
-models:
-- id: openai:gpt-4.1-mini
-  name: GPT-4.1 Mini (OpenAI)
-  required_env:
-  - OPENAI_API_KEY
-- id: openai:gpt-4o
-  name: GPT-4o (OpenAI)
-  required_env:
-  - OPENAI_API_KEY
-- id: openai:o4-mini
-  name: o4-Mini (OpenAI)
-  required_env:
-  - OPENAI_API_KEY
+runtime_config:
+  model: openai:gpt-4.1-mini
+  models:
+  - id: openai:gpt-4.1-mini
+    name: GPT-4.1 Mini (OpenAI)
+    required_env:
+    - OPENAI_API_KEY
+  - id: openai:gpt-4o
+    name: GPT-4o (OpenAI)
+    required_env:
+    - OPENAI_API_KEY
+  - id: openai:o4-mini
+    name: o4-Mini (OpenAI)
+    required_env:
+    - OPENAI_API_KEY
+  - id: groq:llama-3.3-70b-versatile
+    name: Llama 3.3 70B (Groq)
+    required_env:
+    - GROQ_API_KEY
+  - id: groq:meta-llama/llama-4-scout-17b-16e-instruct
+    name: Llama 4 Scout (Groq)
+    required_env:
+    - GROQ_API_KEY
+  - id: openrouter:openai/gpt-4.1-mini
+    name: GPT-4.1 Mini (OpenRouter)
+    required_env:
+    - OPENROUTER_API_KEY
+  - id: openrouter:anthropic/claude-sonnet-4-5
+    name: Claude Sonnet 4.5 (OpenRouter)
+    required_env:
+    - OPENROUTER_API_KEY
