@@ -22,6 +22,16 @@ from a2a.server.agent_execution import AgentExecutor
 
 logger = logging.getLogger(__name__)
 
+# Providers supported by this adapter; maps prefix → (auth_env_vars, default_base_url).
+OPENCLAW_PROVIDERS = {
+    "openai":     (("OPENAI_API_KEY",),                     "https://api.openai.com/v1"),
+    "groq":       (("GROQ_API_KEY",),                       "https://api.groq.com/openai/v1"),
+    "openrouter": (("OPENROUTER_API_KEY",),                 "https://openrouter.ai/api/v1"),
+    "qianfan":    (("QIANFAN_API_KEY", "AISTUDIO_API_KEY"), "https://qianfan.baidubce.com/v2"),
+    "minimax":    (("MINIMAX_API_KEY",),                    "https://api.minimaxi.com/v1"),
+    "moonshot":   (("KIMI_API_KEY",),                       "https://api.moonshot.ai/v1"),
+}
+
 OPENCLAW_WORKSPACE = os.path.expanduser("~/.openclaw/workspace-dev/main")
 OPENCLAW_PORT = 18789
 
@@ -91,29 +101,10 @@ class OpenClawAdapter(BaseAdapter):
             logger.info("OpenClaw CLI installed")
 
         # 2. Resolve API key and model
-        prefix = config.model.split(":")[0] if ":" in config.model else "openai"
-        _api_key_by_prefix = {
-            "openai":     ("OPENAI_API_KEY",),
-            "groq":       ("GROQ_API_KEY",),
-            "openrouter": ("OPENROUTER_API_KEY",),
-            "qianfan":    ("QIANFAN_API_KEY", "AISTUDIO_API_KEY"),
-            "minimax":    ("MINIMAX_API_KEY",),
-            "moonshot":   ("KIMI_API_KEY",),
-        }
-        _provider_urls = {
-            "openai":     "https://api.openai.com/v1",
-            "groq":       "https://api.groq.com/openai/v1",
-            "openrouter": "https://openrouter.ai/api/v1",
-            "qianfan":    "https://qianfan.baidubce.com/v2",
-            "minimax":    "https://api.minimaxi.com/v1",
-            "moonshot":   "https://api.moonshot.ai/v1",
-        }
-        env_vars = _api_key_by_prefix.get(prefix, ("OPENAI_API_KEY",))
-        api_key = next((os.environ[v] for v in env_vars if os.environ.get(v)), "")
-        provider_url = config.runtime_config.get("provider_url", _provider_urls.get(prefix, _provider_urls["openai"]))
-        model = config.model
-        if ":" in model:
-            _, model = model.split(":", 1)
+        from adapter_base import resolve_provider_routing
+        api_key, provider_url, model = resolve_provider_routing(
+            config.model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
+        )
 
         # 3. Run non-interactive onboard
         if not os.path.exists(os.path.expanduser("~/.openclaw/openclaw.json")):
