@@ -1,11 +1,19 @@
 FROM python:3.11-slim
 
+# openclaw CLI requires Node 22.12+ (per `npm install -g openclaw` engine check).
+# Debian Bookworm/Trixie nodejs apt package ships v20.x — too old.
+# Install Node 22 from NodeSource instead. Verify with `node --version` at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl gosu ca-certificates nodejs npm \
-    && rm -rf /var/lib/apt/lists/*
+    curl gosu ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version | grep -E '^v22\.' || (echo "::error::expected Node 22, got $(node --version)" >&2; exit 1)
 
-# Install OpenClaw CLI
-RUN npm install -g openclaw 2>/dev/null || true
+# Install OpenClaw CLI. Fail loud if install or version probe fails — previously
+# this had `|| true` which silently shipped a broken image (see internal#418).
+RUN npm install -g openclaw \
+    && openclaw --version
 
 RUN useradd -u 1000 -m -s /bin/bash agent
 WORKDIR /app
@@ -29,3 +37,4 @@ COPY __init__.py .
 ENV ADAPTER_MODULE=adapter
 
 ENTRYPOINT ["molecule-runtime"]
+# no-op: unstick wedged validate-runtime
