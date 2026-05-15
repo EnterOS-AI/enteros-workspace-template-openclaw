@@ -252,3 +252,4 @@ class OpenClawA2AExecutor(AgentExecutor):
 
 
 Adapter = OpenClawAdapter
+# no-op: retrigger CI
