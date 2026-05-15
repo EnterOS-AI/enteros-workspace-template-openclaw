@@ -106,16 +106,46 @@ class OpenClawAdapter(BaseAdapter):
             config.model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
         )
 
+        # 2b. CP-proxy-token routing override for Minimax.
+        #
+        # `sk-cp-*` keys are issued by molecule-controlplane's claude-proxy
+        # (Anthropic-compatible interface). The native Minimax v1 endpoint
+        # `api.minimaxi.com/v1` does NOT recognise them — it returns
+        # `{"base_resp":{"status_code":2049,"status_msg":"invalid api key"}}`
+        # which surfaces in canvas chat as `FailoverError: HTTP 401`.
+        #
+        # The proxy IS reachable through Minimax's Anthropic-compat path
+        # at `api.minimax.io/anthropic` (note .io, not .com). Verified
+        # live 2026-05-15: a `sk-cp-*` token POSTed to
+        # `api.minimax.io/anthropic/v1/messages` with
+        # `anthropic-version: 2023-06-01` returns 200 with a real model
+        # response.
+        #
+        # We only override when BOTH (a) the resolved provider_url is
+        # the native minimaxi.com path and (b) the key carries the
+        # claude-proxy prefix. A user who supplies a real native Minimax
+        # JWT (not `sk-cp-`) keeps the native path — that path is faster
+        # and avoids the Anthropic-compat translation layer.
+        compatibility = "openai"
+        if api_key.startswith("sk-cp-") and "minimaxi.com" in provider_url:
+            logger.info(
+                "Detected sk-cp- claude-proxy token for native-Minimax route; "
+                "switching to Minimax Anthropic-compat endpoint "
+                "(api.minimax.io/anthropic)"
+            )
+            provider_url = "https://api.minimax.io/anthropic"
+            compatibility = "anthropic"
+
         # 3. Run non-interactive onboard
         if not os.path.exists(os.path.expanduser("~/.openclaw/openclaw.json")):
-            logger.info(f"Running OpenClaw onboard (model: {model})...")
+            logger.info(f"Running OpenClaw onboard (model: {model}, compat: {compatibility})...")
             subprocess.run(
                 ["openclaw", "onboard", "--non-interactive",
                  "--auth-choice", "custom-api-key",
                  "--custom-base-url", provider_url,
                  "--custom-model-id", model,
                  "--custom-api-key", api_key,
-                 "--custom-compatibility", "openai",
+                 "--custom-compatibility", compatibility,
                  "--secret-input-mode", "plaintext",
                  "--accept-risk", "--skip-health"],
                 capture_output=True, text=True, timeout=60,
@@ -152,6 +182,68 @@ class OpenClawAdapter(BaseAdapter):
             with open(auth_file, "w") as f:
                 json_mod.dump(auth_data, f, indent=2)
             logger.info(f"Wrote auth-profiles.json for {provider_name}")
+
+        # 3d. Smoke-probe the configured base URL with the configured key.
+        # If the upstream rejects the credential at boot we want to fail
+        # loudly here — surfacing the routing/credential mismatch in the
+        # workspace boot log — instead of letting the first canvas
+        # message hit a confusing HTTP 401 / FailoverError. Only the
+        # auth surface is probed (a single chat-completion request with
+        # max_tokens=1), so it costs ~one token and ~one round trip.
+        # Network errors and non-auth HTTP failures are logged but not
+        # fatal: the gateway might still be usable for non-chat flows,
+        # and we don't want a transient upstream outage to brick the
+        # workspace boot.
+        try:
+            import urllib.request as _urlreq
+            import urllib.error as _urlerr
+            if compatibility == "anthropic":
+                _probe_url = provider_url.rstrip("/") + "/v1/messages"
+                _probe_headers = {
+                    "anthropic-version": "2023-06-01",
+                    "x-api-key": api_key,
+                    "content-type": "application/json",
+                }
+                _probe_body = json.dumps({
+                    "model": model.split(":", 1)[-1],
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                }).encode()
+            else:
+                # OpenAI-compat probe — most providers in OPENCLAW_PROVIDERS
+                # expose /chat/completions at the configured base URL.
+                _probe_url = provider_url.rstrip("/") + "/chat/completions"
+                _probe_headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                }
+                _probe_body = json.dumps({
+                    "model": model.split(":", 1)[-1],
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                }).encode()
+            _req = _urlreq.Request(_probe_url, data=_probe_body, headers=_probe_headers, method="POST")
+            try:
+                with _urlreq.urlopen(_req, timeout=10) as _resp:
+                    _code = _resp.getcode()
+                    logger.info(f"Upstream auth smoke probe ok ({_probe_url} -> HTTP {_code})")
+            except _urlerr.HTTPError as _he:
+                if _he.code == 401 or _he.code == 403:
+                    raise RuntimeError(
+                        f"Upstream auth smoke probe rejected the configured key at "
+                        f"{_probe_url} (HTTP {_he.code}). The MINIMAX_API_KEY / "
+                        f"provider credential and provider_url={provider_url} "
+                        f"are incompatible. Fix the secret or the routing override "
+                        f"in adapter.py before this workspace can chat."
+                    )
+                logger.warning(
+                    f"Upstream auth smoke probe non-fatal failure at {_probe_url}: "
+                    f"HTTP {_he.code}; continuing"
+                )
+        except RuntimeError:
+            raise
+        except Exception as _e:
+            logger.warning(f"Upstream auth smoke probe could not run ({type(_e).__name__}: {_e}); continuing")
 
         # 4. Copy workspace files from /configs to OpenClaw's workspace dir
         os.makedirs(OPENCLAW_WORKSPACE, exist_ok=True)
