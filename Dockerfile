@@ -37,3 +37,4 @@ COPY __init__.py .
 ENV ADAPTER_MODULE=adapter
 
 ENTRYPOINT ["molecule-runtime"]
+# no-op: unstick wedged validate-runtime
