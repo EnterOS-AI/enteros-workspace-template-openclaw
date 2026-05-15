@@ -92,18 +92,25 @@ class OpenClawAdapter(BaseAdapter):
 
         # 2. Resolve API key and model
         prefix = config.model.split(":")[0] if ":" in config.model else "openai"
-        if prefix == "qianfan":
-            api_key = os.environ.get("QIANFAN_API_KEY", os.environ.get("AISTUDIO_API_KEY", ""))
-        else:
-            api_key = os.environ.get("OPENAI_API_KEY", os.environ.get("GROQ_API_KEY", os.environ.get("OPENROUTER_API_KEY", "")))
-        # Determine provider URL from model prefix
-        provider_urls = {
-            "openai": "https://api.openai.com/v1",
-            "groq": "https://api.groq.com/openai/v1",
-            "openrouter": "https://openrouter.ai/api/v1",
-            "qianfan": "https://qianfan.baidubce.com/v2",
+        _api_key_by_prefix = {
+            "openai":     ("OPENAI_API_KEY",),
+            "groq":       ("GROQ_API_KEY",),
+            "openrouter": ("OPENROUTER_API_KEY",),
+            "qianfan":    ("QIANFAN_API_KEY", "AISTUDIO_API_KEY"),
+            "minimax":    ("MINIMAX_API_KEY",),
+            "moonshot":   ("KIMI_API_KEY",),
         }
-        provider_url = config.runtime_config.get("provider_url", provider_urls.get(prefix, "https://api.openai.com/v1"))
+        _provider_urls = {
+            "openai":     "https://api.openai.com/v1",
+            "groq":       "https://api.groq.com/openai/v1",
+            "openrouter": "https://openrouter.ai/api/v1",
+            "qianfan":    "https://qianfan.baidubce.com/v2",
+            "minimax":    "https://api.minimaxi.com/v1",
+            "moonshot":   "https://api.moonshot.ai/v1",
+        }
+        env_vars = _api_key_by_prefix.get(prefix, ("OPENAI_API_KEY",))
+        api_key = next((os.environ[v] for v in env_vars if os.environ.get(v)), "")
+        provider_url = config.runtime_config.get("provider_url", _provider_urls.get(prefix, _provider_urls["openai"]))
         model = config.model
         if ":" in model:
             _, model = model.split(":", 1)
