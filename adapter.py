@@ -101,7 +101,7 @@ class OpenClawAdapter(BaseAdapter):
             logger.info("OpenClaw CLI installed")
 
         # 2. Resolve API key and model
-        from adapter_base import resolve_provider_routing
+        from molecule_runtime.adapter_base import resolve_provider_routing
         api_key, provider_url, model = resolve_provider_routing(
             config.model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
         )
@@ -252,3 +252,4 @@ class OpenClawA2AExecutor(AgentExecutor):
 
 
 Adapter = OpenClawAdapter
+# no-op: retrigger CI
