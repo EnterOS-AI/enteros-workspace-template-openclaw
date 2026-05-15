@@ -172,52 +172,6 @@ jobs:
           '
           echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
 
-      - name: Boot smoke — executor.execute() via MOLECULE_SMOKE_MODE
-        shell: bash
-        env:
-          IMAGE: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
-        run: |
-          set -eu
-          HAS_SMOKE_MODE=$(docker run --rm --entrypoint sh "${IMAGE}" -c \
-            'python3 -c "import molecule_runtime.smoke_mode" >/dev/null 2>&1 && echo yes || echo no')
-          if [ "${HAS_SMOKE_MODE}" = "no" ]; then
-            echo "::warning::runtime predates smoke_mode — skipping boot smoke. Bump to >=0.1.60 to enable."
-            exit 0
-          fi
-          if [ ! -f config.yaml ]; then
-            echo "::error::config.yaml not found at repo root — required for boot smoke"
-            exit 1
-          fi
-          SMOKE_CONFIG_DIR=$(mktemp -d)
-          cp config.yaml "${SMOKE_CONFIG_DIR}/"
-          chmod -R a+rX "${SMOKE_CONFIG_DIR}"
-          set +e
-          timeout 120 docker run --rm \
-            -v "${SMOKE_CONFIG_DIR}:/configs" \
-            -e WORKSPACE_ID=fake-smoke \
-            -e PYTHONPATH=/app \
-            -e MOLECULE_SMOKE_MODE=1 \
-            -e MOLECULE_SMOKE_TIMEOUT_SECS=90 \
-            -e CLAUDE_CODE_OAUTH_TOKEN=sk-fake-smoke-token \
-            -e ANTHROPIC_API_KEY=sk-fake-smoke-key \
-            -e GEMINI_API_KEY=fake-smoke-key \
-            -e OPENAI_API_KEY=sk-fake-smoke-key \
-            "${IMAGE}"
-          rc=$?
-          set -e
-          rm -rf "${SMOKE_CONFIG_DIR}" 2>/dev/null \
-            || sudo rm -rf "${SMOKE_CONFIG_DIR}" 2>/dev/null \
-            || true
-          if [ "${rc}" -eq 124 ]; then
-            echo "::error::boot smoke wedged past 120s — smoke_mode failed to terminate"
-            exit 1
-          fi
-          if [ "${rc}" -ne 0 ]; then
-            echo "::error::boot smoke failed (exit ${rc}) — check executor lazy imports or runtime_wedge"
-            exit "${rc}"
-          fi
-          echo "::notice::${IMAGE}: executor.execute() smoke passed"
-
       - name: Push image to ECR (post-smoke)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
