@@ -552,4 +552,4 @@ class OpenClawA2AExecutor(AgentExecutor):
 
 
 Adapter = OpenClawAdapter
-# no-op: retrigger CI
+# no-op: retrigger CI validate aggregator (Gitea scheduler stuck on if:always)
