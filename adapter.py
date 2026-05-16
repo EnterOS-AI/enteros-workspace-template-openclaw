@@ -34,6 +34,12 @@ OPENCLAW_PROVIDERS = {
 
 OPENCLAW_WORKSPACE = os.path.expanduser("~/.openclaw/workspace-dev/main")
 OPENCLAW_PORT = 18789
+# Port for the molecule A2A MCP server (HTTP transport). HTTP is used
+# instead of stdio because a2a_mcp_server's stdio main() blocks on a
+# fixed-size stdin.read(65536) that never returns for a small
+# keep-stdin-open MCP client (OpenClaw's bundle-mcp), tripping a 30s
+# handshake timeout. The HTTP transport (also used by Hermes) is unaffected.
+OPENCLAW_MCP_HTTP_PORT = 9100
 
 # Known missing optional deps in OpenClaw's npm package
 OPENCLAW_MISSING_DEPS = ["@buape/carbon", "@larksuiteoapi/node-sdk", "@slack/web-api", "grammy"]
@@ -43,6 +49,7 @@ class OpenClawAdapter(BaseAdapter):
 
     def __init__(self):
         self._gateway_process = None
+        self._mcp_process = None
 
     @staticmethod
     def name() -> str:
@@ -160,6 +167,40 @@ class OpenClawAdapter(BaseAdapter):
             if os.path.isfile(src) and fname.endswith(".md"):
                 shutil.copy2(src, os.path.join(OPENCLAW_WORKSPACE, fname))
                 logger.debug(f"Copied {fname} to OpenClaw workspace")
+
+        # 4b. Register the molecule A2A MCP server with OpenClaw.
+        #
+        # Why this exists
+        # ---------------
+        # Without this step OpenClaw only exposes its native tool profile
+        # (sessions_list, sessions_send, subagents, ...). When the user
+        # asks "can you see your peers" the model reaches for the native
+        # `sessions_list` (OpenClaw's own sessions) and cannot see
+        # molecule platform peers, because the molecule platform tools
+        # (list_peers, get_workspace_info, delegate_task,
+        # send_message_to_user, ...) were never wired into OpenClaw's
+        # tool loop. This is the OpenClaw analogue of the Hermes #129
+        # root cause (generated agent config missing the molecule
+        # platform tool registration) — surfaced differently because
+        # OpenClaw has a competing native tool the model prefers.
+        #
+        # Why HTTP transport instead of stdio
+        # -----------------------------------
+        # molecule_runtime.a2a_mcp_server's stdio main() reads stdin via
+        # a blocking `stdin.read(65536)` that does not return until 64KB
+        # arrive OR stdin hits EOF. MCP clients (OpenClaw's bundle-mcp,
+        # Claude Code, ...) send one small newline-delimited JSON message
+        # and keep stdin open, so the stdio server never parses
+        # `initialize` and OpenClaw times the MCP handshake out after
+        # 30s ("MCP error -32000: Connection closed"). The HTTP+SSE
+        # transport (the same one Hermes consumes) has no such bug:
+        # `--transport http --port 9100` answers `initialize`
+        # immediately. We run it as a supervised sidecar and register it
+        # with OpenClaw as a streamable-http MCP server.
+        #
+        # Diagnosed 2026-05-15 on prod workspace
+        # ced1e6b2-b680-4314-816d-2d0cf6b12f71.
+        await self._setup_molecule_mcp()
 
         # 5. Start the gateway as a background process
         gateway_port = config.runtime_config.get("gateway_port", OPENCLAW_PORT)
@@ -324,6 +365,99 @@ class OpenClawAdapter(BaseAdapter):
                 f"{PAIRED_JSON} not present at setup time; "
                 "scope grant will be applied lazily by execute() fallback"
             )
+
+    async def _setup_molecule_mcp(self):
+        """Start the molecule A2A MCP server (HTTP transport) as a
+        supervised sidecar and register it with OpenClaw.
+
+        Fail-fast: if the MCP server does not answer an ``initialize``
+        request, raise — a workspace that boots without peer-discovery
+        tools is a silent half-failure (the model falls back to native
+        ``sessions_list`` and the user sees "only my own session").
+        Mirrors the Hermes #129/PR#22 fix shape: register the molecule
+        platform tools + assert they are reachable before the runtime
+        is considered ready.
+        """
+        port = OPENCLAW_MCP_HTTP_PORT
+        mcp_url = f"http://127.0.0.1:{port}/mcp"
+
+        # Inherit the container env; a2a_mcp_server resolves WORKSPACE_ID
+        # / PLATFORM_URL from it (set by the workspace container). PATH is
+        # pinned so the absolute interpreter resolves even under the
+        # minimal env a supervisor child may get.
+        env = os.environ.copy()
+        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+
+        logger.info(f"Starting molecule A2A MCP server (HTTP) on port {port}...")
+        self._mcp_process = subprocess.Popen(
+            [
+                "python3", "-m", "molecule_runtime.a2a_mcp_server",
+                "--transport", "http", "--port", str(port),
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+
+        # Fail-fast smoke: the HTTP server must answer `initialize`.
+        import urllib.request
+
+        ready = False
+        last_err = ""
+        for attempt in range(15):
+            await asyncio.sleep(1)
+            if self._mcp_process.poll() is not None:
+                raise RuntimeError(
+                    "molecule A2A MCP server exited during startup "
+                    f"(rc={self._mcp_process.returncode})"
+                )
+            try:
+                req = urllib.request.Request(
+                    mcp_url,
+                    data=json.dumps({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {"name": "adapter-smoke", "version": "1"},
+                        },
+                    }).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    body = resp.read().decode(errors="replace")
+                if '"serverInfo"' in body and '"molecule"' in body:
+                    ready = True
+                    logger.info("molecule A2A MCP server healthy (HTTP)")
+                    break
+                last_err = f"unexpected initialize response: {body[:200]}"
+            except Exception as e:  # noqa: BLE001 — smoke loop, retry
+                last_err = str(e)
+        if not ready:
+            raise RuntimeError(
+                "molecule A2A MCP server did not become healthy within "
+                f"15s — peer-discovery tools would be missing. Last error: {last_err}"
+            )
+
+        # Register the molecule MCP server with OpenClaw as a
+        # streamable-http server. OpenClaw normalises {"type":"http",
+        # "url":...} to {"url":..., "transport":"streamable-http"} and
+        # reads this on gateway start.
+        result = subprocess.run(
+            ["openclaw", "mcp", "set", "molecule",
+             json.dumps({"type": "http", "url": mcp_url})],
+            capture_output=True, text=True, timeout=30,
+            env=os.environ.copy(),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"`openclaw mcp set molecule` failed (rc={result.returncode}): "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        logger.info("Registered molecule MCP server with OpenClaw")
 
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
         return OpenClawA2AExecutor(heartbeat=config.heartbeat)
