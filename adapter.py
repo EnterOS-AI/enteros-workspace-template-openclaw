@@ -106,28 +106,49 @@ class OpenClawAdapter(BaseAdapter):
             config.model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
         )
 
-        # 2b. CP-proxy-token routing override for Minimax.
+        # 2b. CP-proxy-token routing override.
         #
-        # `sk-cp-*` keys are issued by molecule-controlplane's claude-proxy
-        # (Anthropic-compatible interface). The native Minimax v1 endpoint
-        # `api.minimaxi.com/v1` does NOT recognise them — it returns
-        # `{"base_resp":{"status_code":2049,"status_msg":"invalid api key"}}`
-        # which surfaces in canvas chat as `FailoverError: HTTP 401`.
+        # Some upstream credentials are issued as Anthropic-compat proxy
+        # tokens whose ONLY valid surface is an Anthropic Messages
+        # gateway — the provider's native OpenAI-compat endpoint (the
+        # registry default) 401s them. We detect such tokens by key
+        # shape and, when the resolved route is still the native path,
+        # rewrite `provider_url` + flip the onboard compatibility to
+        # `anthropic`. We deliberately reuse the EXISTING mechanism:
+        # the onboard call below already wires --custom-base-url /
+        # --custom-compatibility into ~/.openclaw/openclaw.json, and the
+        # step-3c block already writes ~/.openclaw/.../auth-profiles.json
+        # keyed off `provider_url`. So routing == mutating these three
+        # locals; no new file-writer is introduced. A user supplying a
+        # real native JWT (not the proxy prefix) keeps the native path.
         #
-        # The proxy IS reachable through Minimax's Anthropic-compat path
-        # at `api.minimax.io/anthropic` (note .io, not .com). Verified
-        # live 2026-05-15: a `sk-cp-*` token POSTed to
-        # `api.minimax.io/anthropic/v1/messages` with
-        # `anthropic-version: 2023-06-01` returns 200 with a real model
-        # response.
+        # --- MiniMax token-plan (`sk-cp-*`) ---
+        # `sk-cp-*` keys come from molecule-controlplane's claude-proxy.
+        # The native Minimax v1 endpoint (api.minimaxi.com/v1) returns
+        # `{"base_resp":{"status_code":2049,"status_msg":"invalid api
+        # key"}}` -> canvas `FailoverError: HTTP 401`. The proxy IS
+        # reachable via Minimax's Anthropic-compat path at
+        # api.minimax.io/anthropic (note .io, not .com).
         #
-        # We only override when BOTH (a) the resolved provider_url is
-        # the native minimaxi.com path and (b) the key carries the
-        # claude-proxy prefix. A user who supplies a real native Minimax
-        # JWT (not `sk-cp-`) keeps the native path — that path is faster
-        # and avoids the Anthropic-compat translation layer.
+        # --- Kimi For Coding (`sk-kimi-*`) ---
+        # `sk-kimi-*` keys are minted at platform.kimi.ai/console/api-keys
+        # for Moonshot's "Kimi For Coding" tier. They CANNOT authenticate
+        # against the legacy api.moonshot.ai surfaces (the registry
+        # default for `moonshot:*`): chat/completions, /v1/models and
+        # /anthropic/v1/messages all 401 `invalid_authentication_error`.
+        # Their only valid surface is the Anthropic Messages gateway at
+        # https://api.kimi.com/coding (messages path /coding/v1/messages).
+        # That gateway additionally gates on User-Agent: only coding-agent
+        # UAs are accepted (non-coding UAs 403 `access_terminated_error`).
+        # OpenClaw's Anthropic SDK shim sends a `claude-cli/<version>` UA
+        # on every request, which passes the allowlist, so no extra UA
+        # config is needed on our side — same as the MiniMax path. The
+        # gateway serves a single model id (`kimi-for-coding`), so we
+        # pin the model when we take this route (the canvas writes
+        # shapes like `moonshot:kimi-k2` / `kimi-coding/kimi-k2` that
+        # the gateway rejects).
         compatibility = "openai"
-        if api_key.startswith("sk-cp-") and "minimaxi.com" in provider_url:
+        if api_key and api_key.startswith("sk-cp-") and "minimaxi.com" in provider_url:
             logger.info(
                 "Detected sk-cp- claude-proxy token for native-Minimax route; "
                 "switching to Minimax Anthropic-compat endpoint "
@@ -135,6 +156,15 @@ class OpenClawAdapter(BaseAdapter):
             )
             provider_url = "https://api.minimax.io/anthropic"
             compatibility = "anthropic"
+        elif api_key and api_key.startswith("sk-kimi-") and "moonshot.ai" in provider_url:
+            logger.info(
+                "Detected sk-kimi- Kimi-For-Coding token for native-Moonshot "
+                "route; switching to Kimi Anthropic-compat endpoint "
+                "(api.kimi.com/coding, model kimi-for-coding)"
+            )
+            provider_url = "https://api.kimi.com/coding"
+            compatibility = "anthropic"
+            model = "kimi-for-coding"
 
         # 3. Run non-interactive onboard
         if not os.path.exists(os.path.expanduser("~/.openclaw/openclaw.json")):
@@ -183,17 +213,26 @@ class OpenClawAdapter(BaseAdapter):
                 json_mod.dump(auth_data, f, indent=2)
             logger.info(f"Wrote auth-profiles.json for {provider_name}")
 
-        # 3d. Smoke-probe the configured base URL with the configured key.
+        # 3d. Boot-time auth smoke probe for the configured route.
+        #
         # If the upstream rejects the credential at boot we want to fail
-        # loudly here — surfacing the routing/credential mismatch in the
+        # loudly HERE — surfacing the routing/credential mismatch in the
         # workspace boot log — instead of letting the first canvas
-        # message hit a confusing HTTP 401 / FailoverError. Only the
-        # auth surface is probed (a single chat-completion request with
-        # max_tokens=1), so it costs ~one token and ~one round trip.
-        # Network errors and non-auth HTTP failures are logged but not
-        # fatal: the gateway might still be usable for non-chat flows,
-        # and we don't want a transient upstream outage to brick the
-        # workspace boot.
+        # message hit a confusing HTTP 401 / FailoverError after the
+        # ~7-minute gateway cold-start. Only the auth surface is probed
+        # (a single max_tokens=1 request), so it costs ~one token and
+        # ~one round trip. Network / non-auth HTTP failures are logged
+        # but NOT fatal: the gateway may still be usable and we don't
+        # want a transient upstream blip to brick workspace boot.
+        #
+        # The probe matches the SAME wire shape the gateway will use:
+        #  - anthropic-compat routes -> POST {base}/v1/messages with
+        #    `anthropic-version` + `x-api-key`. For the Kimi-For-Coding
+        #    gateway we ALSO send a `claude-cli/*` User-Agent, because
+        #    that endpoint 403s non-coding-agent UAs — probing with the
+        #    same UA openclaw's Anthropic shim sends proves end-to-end
+        #    reachability (auth AND the UA allowlist), not just network.
+        #  - openai-compat routes -> POST {base}/chat/completions.
         try:
             import urllib.request as _urlreq
             import urllib.error as _urlerr
@@ -204,14 +243,18 @@ class OpenClawAdapter(BaseAdapter):
                     "x-api-key": api_key,
                     "content-type": "application/json",
                 }
+                # Kimi-For-Coding gates on a coding-agent UA; openclaw's
+                # Anthropic SDK shim sends claude-cli/* so we mirror it.
+                if "api.kimi.com" in provider_url:
+                    _probe_headers["user-agent"] = "claude-cli/1.0 (molecule-openclaw boot-probe)"
                 _probe_body = json.dumps({
                     "model": model.split(":", 1)[-1],
                     "max_tokens": 1,
                     "messages": [{"role": "user", "content": "ping"}],
                 }).encode()
             else:
-                # OpenAI-compat probe — most providers in OPENCLAW_PROVIDERS
-                # expose /chat/completions at the configured base URL.
+                # OpenAI-compat probe — most registry providers expose
+                # /chat/completions at the configured base URL.
                 _probe_url = provider_url.rstrip("/") + "/chat/completions"
                 _probe_headers = {
                     "Authorization": f"Bearer {api_key}",
@@ -228,13 +271,14 @@ class OpenClawAdapter(BaseAdapter):
                     _code = _resp.getcode()
                     logger.info(f"Upstream auth smoke probe ok ({_probe_url} -> HTTP {_code})")
             except _urlerr.HTTPError as _he:
-                if _he.code == 401 or _he.code == 403:
+                if _he.code in (401, 403):
                     raise RuntimeError(
                         f"Upstream auth smoke probe rejected the configured key at "
-                        f"{_probe_url} (HTTP {_he.code}). The MINIMAX_API_KEY / "
-                        f"provider credential and provider_url={provider_url} "
-                        f"are incompatible. Fix the secret or the routing override "
-                        f"in adapter.py before this workspace can chat."
+                        f"{_probe_url} (HTTP {_he.code}). The provider credential and "
+                        f"provider_url={provider_url} are incompatible "
+                        f"(HTTP 403 on api.kimi.com also indicates a blocked "
+                        f"User-Agent). Fix the secret or the routing override in "
+                        f"adapter.py before this workspace can chat."
                     )
                 logger.warning(
                     f"Upstream auth smoke probe non-fatal failure at {_probe_url}: "
@@ -552,4 +596,4 @@ class OpenClawA2AExecutor(AgentExecutor):
 
 
 Adapter = OpenClawAdapter
-# no-op: retrigger CI validate aggregator (Gitea scheduler stuck on if:always)
+# no-op: retrigger CI
