@@ -44,6 +44,58 @@ OPENCLAW_MCP_HTTP_PORT = 9100
 # Known missing optional deps in OpenClaw's npm package
 OPENCLAW_MISSING_DEPS = ["@buape/carbon", "@larksuiteoapi/node-sdk", "@slack/web-api", "grammy"]
 
+# This template's declared default model — mirrors config.yaml's `model:`
+# field. Must be a model whose provider prefix exists in
+# OPENCLAW_PROVIDERS above (openai is the registry's fallback prefix too).
+OPENCLAW_DEFAULT_MODEL = "openai:gpt-4.1-mini"
+
+
+def coerce_servable_model(model_str: str) -> str:
+    """Return a model id whose provider this adapter can actually route.
+
+    Why this exists
+    ---------------
+    The shared molecule-runtime ``config.load_config`` defaults the model
+    to the generic ``anthropic:claude-opus-4-7`` when neither the
+    MODEL/MOLECULE_MODEL/MODEL_PROVIDER env vars NOR a ``model:`` key in
+    ``/configs/config.yaml`` are set. On a *fresh* openclaw provision the
+    controlplane provisioner writes a stub ``/configs/config.yaml`` with
+    no ``model:`` (it only emits one when an operator picked a model),
+    and injects no MODEL env — so the runtime hands this adapter
+    ``anthropic:claude-opus-4-7``. But ``anthropic`` is NOT in
+    ``OPENCLAW_PROVIDERS``: ``resolve_provider_routing`` then falls back
+    to checking ``OPENAI_API_KEY``, finds none, and raises
+    ``RuntimeError: No API key found for provider 'anthropic'`` — which
+    aborts ``setup()`` before the OpenClaw gateway is ever started. The
+    workspace registers but is permanently ``not_configured`` and can
+    never chat, even if the operator later sets a MiniMax/Kimi/OpenAI
+    key (because the *model* is still the unroutable anthropic default).
+
+    A model this adapter cannot structurally serve must never be the
+    effective default. When the resolved model's provider prefix isn't
+    one we know how to route, coerce to this template's own declared
+    default (``OPENCLAW_DEFAULT_MODEL``). An operator who explicitly
+    sets MODEL/config.yaml to a real openclaw-registry model
+    (openai/groq/openrouter/qianfan/minimax/moonshot) is unaffected —
+    that prefix is in the registry, so it passes through untouched.
+    Bare model ids (no ``provider:`` prefix) also pass through:
+    ``resolve_provider_routing`` already treats them as ``openai:`` which
+    IS routable.
+    """
+    if ":" not in model_str:
+        # No provider prefix → resolve_provider_routing treats as openai:* (routable).
+        return model_str
+    prefix = model_str.split(":", 1)[0]
+    if prefix in OPENCLAW_PROVIDERS:
+        return model_str
+    logger.warning(
+        "Configured model %r has provider %r which OpenClaw cannot route "
+        "(known: %s); falling back to template default %r. Set MODEL "
+        "(or config.yaml model:) to an OpenClaw-supported provider to override.",
+        model_str, prefix, ",".join(sorted(OPENCLAW_PROVIDERS)), OPENCLAW_DEFAULT_MODEL,
+    )
+    return OPENCLAW_DEFAULT_MODEL
+
 
 class OpenClawAdapter(BaseAdapter):
 
@@ -109,8 +161,13 @@ class OpenClawAdapter(BaseAdapter):
 
         # 2. Resolve API key and model
         from molecule_runtime.adapter_base import resolve_provider_routing
+        # Never let an unroutable generic default (anthropic:claude-opus-4-7
+        # from the shared runtime's load_config) reach a registry that has
+        # no `anthropic` entry — that bricks fresh provisions. See
+        # coerce_servable_model for the full rationale.
+        servable_model = coerce_servable_model(config.model)
         api_key, provider_url, model = resolve_provider_routing(
-            config.model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
+            servable_model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
         )
 
         # 2b. CP-proxy-token routing override.
