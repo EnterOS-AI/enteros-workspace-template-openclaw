@@ -46,8 +46,11 @@ class TestCoerceServableModel:
         be coerced to a model OpenClaw can actually route."""
         out = adapter.coerce_servable_model("anthropic:claude-opus-4-7")
         assert out == adapter.OPENCLAW_DEFAULT_MODEL
-        assert out == "openai:gpt-4.1-mini"
-        # And the result must itself be routable by the registry.
+        # And the result must itself be routable by the registry. (We
+        # assert the structural invariant, not a hard-coded slug —
+        # the literal default changed when the second root cause, the
+        # keyless coercion target, was fixed; see
+        # TestDefaultModelKeyIsPresentInFreshWorkspace.)
         assert out.split(":", 1)[0] in adapter.OPENCLAW_PROVIDERS
 
     @pytest.mark.parametrize(
@@ -91,3 +94,71 @@ class TestCoerceServableModel:
         the exact bug for every keyless fresh provision."""
         prefix = adapter.OPENCLAW_DEFAULT_MODEL.split(":", 1)[0]
         assert prefix in adapter.OPENCLAW_PROVIDERS
+
+
+class TestDefaultModelKeyIsPresentInFreshWorkspace:
+    """Second, distinct root cause (NOT the PR#18 routability gap).
+
+    PR#18's coerce_servable_model correctly catches the unroutable
+    ``anthropic:claude-opus-4-7`` generic default and coerces it to
+    OPENCLAW_DEFAULT_MODEL. But it coerced to ``openai:gpt-4.1-mini``
+    whose required env (``OPENAI_API_KEY``) is NOT injected into a fresh
+    openclaw workspace — the credential a fresh prod openclaw workspace
+    genuinely receives is ``MINIMAX_API_KEY`` (an ``sk-cp-*``
+    claude-proxy token; see adapter.py's sk-cp-/MiniMax routing override
+    and the seeded ``custom-api-minimaxi-com`` provider). So
+    resolve_provider_routing still raised::
+
+        RuntimeError: No API key found for provider 'openai'
+        (checked: OPENAI_API_KEY)
+
+    aborting setup() before _setup_molecule_mcp() — so the platform MCP
+    is never registered and list_peers is impossible. Routability alone
+    is necessary but NOT sufficient: the default's required key must be
+    the one a fresh openclaw workspace actually has.
+    """
+
+    # The credential set a fresh prod openclaw workspace genuinely
+    # receives. Empirically: the ground-truth boot log shows
+    # OPENAI_API_KEY absent (the coercion-target's key), and the seeded
+    # provider is custom-api-minimaxi-com carrying an sk-cp-*
+    # MINIMAX_API_KEY (verified live, hot-patch 3-file schema memory).
+    FRESH_OPENCLAW_ENV = {"MINIMAX_API_KEY": "sk-cp-fresh-provision-token"}
+
+    def test_unroutable_anthropic_default_resolves_to_a_keyed_model(self):
+        """The exact prod chain end-to-end: the generic anthropic
+        default, after coercion, must route with ONLY the key a fresh
+        openclaw workspace has — i.e. resolve_provider_routing must NOT
+        raise under FRESH_OPENCLAW_ENV."""
+        try:
+            from molecule_runtime.adapter_base import resolve_provider_routing
+        except ImportError:
+            pytest.skip(
+                "molecule_runtime.adapter_base unavailable — soft-skip "
+                "matches the canonical validator / repo convention; the "
+                "pure key-presence guard below covers the regression "
+                "without the runtime dependency"
+            )
+
+        servable = adapter.coerce_servable_model("anthropic:claude-opus-4-7")
+        # Must not raise "No API key found for provider ..." — this is
+        # the assertion that fails on the keyless openai default.
+        api_key, base_url, model_id = resolve_provider_routing(
+            servable, self.FRESH_OPENCLAW_ENV,
+            registry=adapter.OPENCLAW_PROVIDERS,
+        )
+        assert api_key == "sk-cp-fresh-provision-token"
+
+    def test_default_models_required_env_is_present_in_fresh_workspace(self):
+        """OPENCLAW_DEFAULT_MODEL's provider must require a key that the
+        fresh-openclaw env actually supplies — not merely be a routable
+        prefix. Closes the gap test_default_model_is_self_consistent
+        left (it only checked the prefix is in the registry)."""
+        prefix = adapter.OPENCLAW_DEFAULT_MODEL.split(":", 1)[0]
+        env_vars, _ = adapter.OPENCLAW_PROVIDERS[prefix]
+        assert any(v in self.FRESH_OPENCLAW_ENV for v in env_vars), (
+            f"OPENCLAW_DEFAULT_MODEL={adapter.OPENCLAW_DEFAULT_MODEL!r} "
+            f"requires one of {env_vars} but a fresh openclaw workspace "
+            f"only has {sorted(self.FRESH_OPENCLAW_ENV)} — setup() will "
+            f"raise 'No API key found' and never wire the platform MCP."
+        )

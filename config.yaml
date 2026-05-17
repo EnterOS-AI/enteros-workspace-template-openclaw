@@ -3,7 +3,13 @@ description: OpenClaw framework — multi-file prompt system with SOUL, BOOTSTRA
 version: 1.0.0
 tier: 2
 runtime: openclaw
-model: openai:gpt-4.1-mini
+# Default model — must mirror adapter.py OPENCLAW_DEFAULT_MODEL. minimax
+# is in OPENCLAW_PROVIDERS AND MINIMAX_API_KEY is the credential a fresh
+# openclaw workspace actually receives (an sk-cp-* token via the seeded
+# custom-api-minimaxi-com provider); openai:* was routable but keyless
+# on fresh provisions, which bricked setup() before the platform MCP
+# was registered.
+model: minimax:MiniMax-M2.7
 prompt_files:
 - SOUL.md
 - BOOTSTRAP.md
@@ -17,8 +23,19 @@ a2a:
   push_notifications: true
 template_schema_version: 1
 runtime_config:
-  model: openai:gpt-4.1-mini
+  model: minimax:MiniMax-M2.7
+  # First entry is the effective default — must match `model:` above and
+  # adapter.py OPENCLAW_DEFAULT_MODEL, and its required_env must be a key
+  # a fresh openclaw workspace genuinely has (MINIMAX_API_KEY).
   models:
+  - id: minimax:MiniMax-M2.7
+    name: MiniMax M2.7 (MiniMax)
+    required_env:
+    - MINIMAX_API_KEY
+  - id: minimax:MiniMax-M2.7-highspeed
+    name: MiniMax M2.7 Highspeed (MiniMax)
+    required_env:
+    - MINIMAX_API_KEY
   - id: openai:gpt-4.1-mini
     name: GPT-4.1 Mini (OpenAI)
     required_env:
@@ -47,14 +64,6 @@ runtime_config:
     name: Claude Sonnet 4.5 (OpenRouter)
     required_env:
     - OPENROUTER_API_KEY
-  - id: minimax:MiniMax-M2.7
-    name: MiniMax M2.7 (MiniMax)
-    required_env:
-    - MINIMAX_API_KEY
-  - id: minimax:MiniMax-M2.7-highspeed
-    name: MiniMax M2.7 Highspeed (MiniMax)
-    required_env:
-    - MINIMAX_API_KEY
   - id: moonshot:kimi-k2.6
     name: Kimi K2.6 (Moonshot)
     required_env:

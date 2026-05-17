@@ -45,9 +45,30 @@ OPENCLAW_MCP_HTTP_PORT = 9100
 OPENCLAW_MISSING_DEPS = ["@buape/carbon", "@larksuiteoapi/node-sdk", "@slack/web-api", "grammy"]
 
 # This template's declared default model — mirrors config.yaml's `model:`
-# field. Must be a model whose provider prefix exists in
-# OPENCLAW_PROVIDERS above (openai is the registry's fallback prefix too).
-OPENCLAW_DEFAULT_MODEL = "openai:gpt-4.1-mini"
+# field. Two hard constraints (both required; routability alone is NOT
+# enough — that gap is the second root cause this default fixes):
+#
+#  1. Its provider prefix MUST exist in OPENCLAW_PROVIDERS above so the
+#     adapter can structurally route it (PR#18's invariant).
+#  2. Its provider's required env key MUST be the credential a *fresh*
+#     openclaw workspace genuinely receives. The earlier
+#     `openai:gpt-4.1-mini` satisfied (1) but NOT (2): a fresh prod
+#     openclaw workspace is provisioned with a `sk-cp-*`
+#     ``MINIMAX_API_KEY`` (the seeded `custom-api-minimaxi-com`
+#     provider), NOT an ``OPENAI_API_KEY``. So coerce_servable_model
+#     correctly rewrote the unroutable ``anthropic:`` generic default to
+#     ``openai:gpt-4.1-mini``, but resolve_provider_routing then raised
+#     ``No API key found for provider 'openai' (checked: OPENAI_API_KEY)``
+#     and aborted setup() before the platform MCP was ever registered —
+#     bricking list_peers on every default-config provision.
+#
+# ``minimax:MiniMax-M2.7`` satisfies both: ``minimax`` is in
+# OPENCLAW_PROVIDERS and its key ``MINIMAX_API_KEY`` is the one fresh
+# openclaw workspaces actually have. The adapter's existing sk-cp-*
+# routing override (step 2b) then steers it onto MiniMax's
+# Anthropic-compat endpoint. It is already a declared, key-consistent
+# entry in config.yaml's runtime_config.models.
+OPENCLAW_DEFAULT_MODEL = "minimax:MiniMax-M2.7"
 
 
 def coerce_servable_model(model_str: str) -> str:
