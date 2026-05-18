@@ -73,6 +73,18 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 COPY adapter.py .
 COPY __init__.py .
 
+# Generic GIT_ASKPASS helper. Reads HTTPS Basic-Auth credentials from
+# env vars (GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD, with GITEA_USER /
+# GITEA_TOKEN as fallback) and emits them on the git credential-prompt
+# protocol, so container-side `git` can authenticate to any private
+# HTTPS remote without on-disk .gitconfig / .git-credentials mutation.
+# Installed as /usr/local/bin/molecule-askpass — the platform-side
+# provisioner sets GIT_ASKPASS to that path. Script body contains no
+# hostnames or vendor literals; the deployer decides which remote the
+# credentials apply to by virtue of populating those env vars.
+COPY scripts/git-askpass.sh /usr/local/bin/molecule-askpass
+RUN chmod +x /usr/local/bin/molecule-askpass
+
 ENV ADAPTER_MODULE=adapter
 
 # molecule-runtime previously ran as root (no entrypoint wrapper), which
