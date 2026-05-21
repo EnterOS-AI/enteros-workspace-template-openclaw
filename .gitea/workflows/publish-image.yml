@@ -63,9 +63,22 @@ jobs:
           fi
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
+  # pc2-safe: false — needs docker (ECR login + buildx + push); routes to the
+  # dedicated Linux publish runners only.
+  #
+  # task #390 B-lite + internal#597: pin to `[publish, release]` (NOT
+  # `ubuntu-latest`). The `ubuntu-latest` label is advertised by BOTH the
+  # Linux operator-host runners AND the Windows/WSL hongming-pc-runner-*
+  # runners (PC2). A docker build/push job landing on PC2 fails with
+  # "Failed to initialize: protocol not available" (npipe→Linux-container
+  # bridging gap). Only molecule-runner-publish-{1,2} advertise BOTH
+  # `publish` and `release`, so the array form excludes the WSL pair
+  # while keeping the dedicated Linux publish runners — matching the
+  # sibling claude-code / codex / hermes templates which already use
+  # [publish, release].
   publish:
     name: Build & push workspace-template-openclaw image
-    runs-on: ubuntu-latest
+    runs-on: [publish, release]
     timeout-minutes: 30
     needs: resolve-version
     steps:
