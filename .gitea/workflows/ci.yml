@@ -92,7 +92,6 @@ jobs:
     runs-on: [ubuntu-latest, docker-host]
     timeout-minutes: 15
     needs: validate-static
-    if: needs.validate-static.result == 'success'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Fetch molecule-ci canonical scripts
@@ -136,9 +135,8 @@ jobs:
     runs-on: [ubuntu-latest, docker-host]
     timeout-minutes: 15
     needs: validate-static
-    # Untrusted-by-design: builds + runs the PR's Dockerfile. Skip on
-    # fork PRs exactly like validate-runtime.
-    if: github.event.pull_request.head.repo.fork != true
+    # Runs after static validation. Avoid job-level if: guards here because
+    # Gitea 1.22.6 can leave the protected context pending instead of skipped.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build the runtime image
@@ -215,7 +213,6 @@ jobs:
     name: validate
     runs-on: ubuntu-latest
     needs: [validate-static, validate-runtime, t4-conformance]
-    if: always()
     timeout-minutes: 1
     steps:
       - name: Aggregate
@@ -234,10 +231,9 @@ jobs:
             echo "::error::validate-runtime did not succeed: $runtime"
             exit 1
           fi
-          # T4 conformance is a HARD gate on internal (non-fork) PRs and
-          # main pushes. `skipped` is only acceptable on fork PRs (where
-          # the `if:` fork guard short-circuits it) — there the static
-          # gate is the floor. Any other non-success fails the build:
+          # T4 conformance is a hard gate; keep accepting `skipped` only
+          # for compatibility with older runs that used job-level guards.
+          # Any other non-success fails the build:
           # "verified" T4 requires this live gate green, never inference.
           if [ "$t4" != "success" ] && [ "$t4" != "skipped" ]; then
             echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
