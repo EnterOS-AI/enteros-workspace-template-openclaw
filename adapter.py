@@ -18,6 +18,7 @@ import subprocess
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
 from molecule_runtime.adapters.shared_runtime import brief_task, extract_message_text, set_current_task
+from molecule_runtime.executor_helpers import extract_attached_files
 from a2a.server.agent_execution import AgentExecutor
 
 logger = logging.getLogger(__name__)
@@ -687,6 +688,18 @@ class OpenClawA2AExecutor(AgentExecutor):
         from a2a.helpers import new_text_message
 
         user_message = extract_message_text(context)
+        attached = extract_attached_files(getattr(context, "message", None))
+        image_media_lines = [
+            f"MEDIA: {f['path']}"
+            for f in attached
+            if (f.get("mime_type") or "").startswith("image/") and f.get("path")
+        ]
+        if image_media_lines:
+            user_message = (
+                user_message.rstrip()
+                + "\n\n"
+                + "\n".join(image_media_lines)
+            ).strip()
 
         if not user_message:
             await event_queue.enqueue_event(new_text_message("No message provided"))

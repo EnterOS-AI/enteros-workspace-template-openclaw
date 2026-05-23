@@ -22,6 +22,7 @@ network) so they run cheap in CI on any runner.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -49,6 +50,21 @@ def _build_context(*, task_id: str | None, context_id: str | None):
     msg.parts = [text_part]
     msg.metadata = None
     ctx.message = msg
+    return ctx
+
+
+def _build_context_with_file(
+    *,
+    task_id: str | None,
+    context_id: str | None,
+    name: str,
+    mime_type: str,
+    path: str,
+):
+    ctx = _build_context(task_id=task_id, context_id=context_id)
+    file_obj = SimpleNamespace(uri=f"file://{path}", name=name, mimeType=mime_type)
+    file_part = SimpleNamespace(kind="file", file=file_obj)
+    ctx.message.parts.append(file_part)
     return ctx
 
 
@@ -177,3 +193,53 @@ async def test_session_id_falls_back_to_default_when_both_unset(monkeypatch):
     args = captured[0]
     sid_idx = args.index("--session-id")
     assert args[sid_idx + 1] == "default"
+
+
+@pytest.mark.asyncio
+async def test_image_attachment_adds_media_token(monkeypatch, tmp_path):
+    """Image file parts are surfaced to OpenClaw's media parser via MEDIA tokens."""
+    import molecule_runtime.executor_helpers as _helpers
+    monkeypatch.setattr(_helpers, "WORKSPACE_MOUNT", str(tmp_path))
+    captured = []
+
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (
+                b'{"result": {"payloads": [{"text": "ok"}]}}',
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured.append(args)
+        return _FakeProc()
+
+    monkeypatch.setattr(
+        adapter.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(
+        adapter, "set_current_task", AsyncMock(return_value=None)
+    )
+
+    png = tmp_path / "shape-probe.png"
+    png.write_bytes(b"png")
+    ex = adapter.OpenClawA2AExecutor(heartbeat=None)
+    ctx = _build_context_with_file(
+        task_id="task-1",
+        context_id="chat-1",
+        name="shape-probe.png",
+        mime_type="image/png",
+        path=str(png),
+    )
+    queue = MagicMock()
+    queue.enqueue_event = AsyncMock()
+
+    await ex.execute(ctx, queue)
+
+    args = captured[0]
+    message = args[args.index("--message") + 1]
+    assert "shape-probe.png" in message
+    assert f"MEDIA: {png}" in message
