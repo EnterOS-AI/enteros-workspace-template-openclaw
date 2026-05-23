@@ -1,4 +1,10 @@
 #!/bin/sh
+# Source persistent workspace secrets BEFORE anything else that might need them.
+# /configs is volume-mounted from the host so this survives container restart.
+if [ -f /configs/secrets.d/load.sh ]; then
+  . /configs/secrets.d/load.sh
+fi
+
 # Drop privileges to the agent user before exec'ing molecule-runtime.
 #
 # Why this exists (T4 + list_peers atomic-close — RFC internal#456 §9-11)
