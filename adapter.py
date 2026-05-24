@@ -19,6 +19,11 @@ import subprocess
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
 from molecule_runtime.adapters.shared_runtime import brief_task, extract_message_text, set_current_task
 from molecule_runtime.executor_helpers import extract_attached_files
+try:
+    from molecule_runtime.attachment_vision import append_image_descriptions
+except ModuleNotFoundError:  # pragma: no cover - older local runtime
+    async def append_image_descriptions(text, files):
+        return text
 from a2a.server.agent_execution import AgentExecutor
 
 logger = logging.getLogger(__name__)
@@ -689,6 +694,8 @@ class OpenClawA2AExecutor(AgentExecutor):
 
         user_message = extract_message_text(context)
         attached = extract_attached_files(getattr(context, "message", None))
+        if attached:
+            user_message = await append_image_descriptions(user_message, attached)
         image_media_lines = [
             f"MEDIA: {f['path']}"
             for f in attached
