@@ -102,6 +102,10 @@ jobs:
       - if: hashFiles('requirements.txt') == ''
         run: pip install -q molecule-ai-workspace-runtime
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: Adapter unit tests
+        run: |
+          pip install -q pytest
+          python3 -m pytest tests/ -q
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
         run: |

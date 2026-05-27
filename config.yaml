@@ -72,3 +72,16 @@ runtime_config:
     name: Kimi K2.5 (Moonshot)
     required_env:
     - KIMI_API_KEY
+  # Molecule platform-managed (no tenant key — platform owns billing). Slash
+  # form (vs the colon BYOK ids above): adapter.py resolve_platform_routing
+  # sends these to the proxy OpenAI-compat surface, which resolves moonshot/*
+  # -> Kimi. Must match the controlplane providers manifest's openclaw platform
+  # set (drift-gated by molecule-ci validate-workspace-template).
+  - id: moonshot/kimi-k2.6
+    name: Kimi K2.6 (Molecule platform)
+    provider: platform
+    required_env: []
+  - id: moonshot/kimi-k2.5
+    name: Kimi K2.5 (Molecule platform)
+    provider: platform
+    required_env: []

@@ -76,6 +76,43 @@ OPENCLAW_MISSING_DEPS = ["@buape/carbon", "@larksuiteoapi/node-sdk", "@slack/web
 # entry in config.yaml's runtime_config.models.
 OPENCLAW_DEFAULT_MODEL = "minimax:MiniMax-M2.7"
 
+# Platform-managed LLM default (slash form the proxy resolves to Moonshot/Kimi).
+OPENCLAW_PLATFORM_DEFAULT_MODEL = "moonshot/kimi-k2.6"
+
+
+def resolve_platform_routing(model_str, env):
+    """When the workspace runs in platform_managed LLM billing, route through
+    the Molecule platform proxy's OpenAI-compat surface, bypassing the
+    per-vendor colon registry (resolve_provider_routing) entirely — in this
+    mode the tenant has no BYOK key (the workspace-server strips them), so the
+    registry path would raise "No API key found".
+
+    Returns (api_key, provider_url, model, compatibility) or None when not
+    platform_managed. Raises RuntimeError if platform_managed but unconfigured
+    (fail closed rather than fall through to a keyless registry route).
+
+    The model id is sent verbatim (a leading "platform/" namespace marker is
+    stripped); the proxy keys on the vendor prefix (moonshot/..., minimax/...,
+    anthropic/..., openai/...). Mirrors the proven smoke
+    (molecule-controlplane scripts/e2e-llm-kimi-smoke.sh).
+    """
+    if env.get("MOLECULE_LLM_BILLING_MODE") != "platform_managed":
+        return None
+    base = env.get("MOLECULE_LLM_BASE_URL") or env.get("OPENAI_BASE_URL")
+    token = env.get("MOLECULE_LLM_USAGE_TOKEN") or env.get("ANTHROPIC_API_KEY")
+    if not base or not token:
+        raise RuntimeError(
+            "platform_managed LLM billing but MOLECULE_LLM_BASE_URL / usage token "
+            "is unset — refusing to fall back to a keyless BYOK route"
+        )
+    model = (model_str or "").strip()
+    if model.startswith("platform/"):
+        model = model[len("platform/"):]
+    if not model:
+        model = OPENCLAW_PLATFORM_DEFAULT_MODEL
+    return token, base, model, "openai"
+
+
 
 def coerce_servable_model(model_str: str) -> str:
     """Return a model id whose provider this adapter can actually route.
@@ -192,70 +229,82 @@ class OpenClawAdapter(BaseAdapter):
         # from the shared runtime's load_config) reach a registry that has
         # no `anthropic` entry — that bricks fresh provisions. See
         # coerce_servable_model for the full rationale.
-        servable_model = coerce_servable_model(config.model)
-        api_key, provider_url, model = resolve_provider_routing(
-            servable_model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
-        )
+        # Platform-managed billing short-circuits the per-vendor colon
+        # registry: route everything through the Molecule proxy. Checked
+        # BEFORE resolve_provider_routing, which would raise on the
+        # stripped-key (no-BYOK) platform environment.
+        _pm = resolve_platform_routing(config.model, os.environ)
+        if _pm is not None:
+            api_key, provider_url, model, compatibility = _pm
+            logger.info(
+                "platform-managed LLM -> proxy %s (model %s, compat openai)",
+                provider_url, model,
+            )
+        else:
+            servable_model = coerce_servable_model(config.model)
+            api_key, provider_url, model = resolve_provider_routing(
+                servable_model, os.environ, registry=OPENCLAW_PROVIDERS, runtime_config=config.runtime_config
+            )
 
-        # 2b. CP-proxy-token routing override.
-        #
-        # Some upstream credentials are issued as Anthropic-compat proxy
-        # tokens whose ONLY valid surface is an Anthropic Messages
-        # gateway — the provider's native OpenAI-compat endpoint (the
-        # registry default) 401s them. We detect such tokens by key
-        # shape and, when the resolved route is still the native path,
-        # rewrite `provider_url` + flip the onboard compatibility to
-        # `anthropic`. We deliberately reuse the EXISTING mechanism:
-        # the onboard call below already wires --custom-base-url /
-        # --custom-compatibility into ~/.openclaw/openclaw.json, and the
-        # step-3c block already writes ~/.openclaw/.../auth-profiles.json
-        # keyed off `provider_url`. So routing == mutating these three
-        # locals; no new file-writer is introduced. A user supplying a
-        # real native JWT (not the proxy prefix) keeps the native path.
-        #
-        # --- MiniMax token-plan (`sk-cp-*`) ---
-        # `sk-cp-*` keys come from molecule-controlplane's claude-proxy.
-        # The native Minimax v1 endpoint (api.minimaxi.com/v1) returns
-        # `{"base_resp":{"status_code":2049,"status_msg":"invalid api
-        # key"}}` -> canvas `FailoverError: HTTP 401`. The proxy IS
-        # reachable via Minimax's Anthropic-compat path at
-        # api.minimax.io/anthropic (note .io, not .com).
-        #
-        # --- Kimi For Coding (`sk-kimi-*`) ---
-        # `sk-kimi-*` keys are minted at platform.kimi.ai/console/api-keys
-        # for Moonshot's "Kimi For Coding" tier. They CANNOT authenticate
-        # against the legacy api.moonshot.ai surfaces (the registry
-        # default for `moonshot:*`): chat/completions, /v1/models and
-        # /anthropic/v1/messages all 401 `invalid_authentication_error`.
-        # Their only valid surface is the Anthropic Messages gateway at
-        # https://api.kimi.com/coding (messages path /coding/v1/messages).
-        # That gateway additionally gates on User-Agent: only coding-agent
-        # UAs are accepted (non-coding UAs 403 `access_terminated_error`).
-        # OpenClaw's Anthropic SDK shim sends a `claude-cli/<version>` UA
-        # on every request, which passes the allowlist, so no extra UA
-        # config is needed on our side — same as the MiniMax path. The
-        # gateway serves a single model id (`kimi-for-coding`), so we
-        # pin the model when we take this route (the canvas writes
-        # shapes like `moonshot:kimi-k2` / `kimi-coding/kimi-k2` that
-        # the gateway rejects).
-        compatibility = "openai"
-        if api_key and api_key.startswith("sk-cp-") and "minimaxi.com" in provider_url:
-            logger.info(
-                "Detected sk-cp- claude-proxy token for native-Minimax route; "
-                "switching to Minimax Anthropic-compat endpoint "
-                "(api.minimax.io/anthropic)"
-            )
-            provider_url = "https://api.minimax.io/anthropic"
-            compatibility = "anthropic"
-        elif api_key and api_key.startswith("sk-kimi-") and "moonshot.ai" in provider_url:
-            logger.info(
-                "Detected sk-kimi- Kimi-For-Coding token for native-Moonshot "
-                "route; switching to Kimi Anthropic-compat endpoint "
-                "(api.kimi.com/coding, model kimi-for-coding)"
-            )
-            provider_url = "https://api.kimi.com/coding"
-            compatibility = "anthropic"
-            model = "kimi-for-coding"
+            # 2b. CP-proxy-token routing override.
+            #
+            # Some upstream credentials are issued as Anthropic-compat proxy
+            # tokens whose ONLY valid surface is an Anthropic Messages
+            # gateway — the provider's native OpenAI-compat endpoint (the
+            # registry default) 401s them. We detect such tokens by key
+            # shape and, when the resolved route is still the native path,
+            # rewrite `provider_url` + flip the onboard compatibility to
+            # `anthropic`. We deliberately reuse the EXISTING mechanism:
+            # the onboard call below already wires --custom-base-url /
+            # --custom-compatibility into ~/.openclaw/openclaw.json, and the
+            # step-3c block already writes ~/.openclaw/.../auth-profiles.json
+            # keyed off `provider_url`. So routing == mutating these three
+            # locals; no new file-writer is introduced. A user supplying a
+            # real native JWT (not the proxy prefix) keeps the native path.
+            #
+            # --- MiniMax token-plan (`sk-cp-*`) ---
+            # `sk-cp-*` keys come from molecule-controlplane's claude-proxy.
+            # The native Minimax v1 endpoint (api.minimaxi.com/v1) returns
+            # `{"base_resp":{"status_code":2049,"status_msg":"invalid api
+            # key"}}` -> canvas `FailoverError: HTTP 401`. The proxy IS
+            # reachable via Minimax's Anthropic-compat path at
+            # api.minimax.io/anthropic (note .io, not .com).
+            #
+            # --- Kimi For Coding (`sk-kimi-*`) ---
+            # `sk-kimi-*` keys are minted at platform.kimi.ai/console/api-keys
+            # for Moonshot's "Kimi For Coding" tier. They CANNOT authenticate
+            # against the legacy api.moonshot.ai surfaces (the registry
+            # default for `moonshot:*`): chat/completions, /v1/models and
+            # /anthropic/v1/messages all 401 `invalid_authentication_error`.
+            # Their only valid surface is the Anthropic Messages gateway at
+            # https://api.kimi.com/coding (messages path /coding/v1/messages).
+            # That gateway additionally gates on User-Agent: only coding-agent
+            # UAs are accepted (non-coding UAs 403 `access_terminated_error`).
+            # OpenClaw's Anthropic SDK shim sends a `claude-cli/<version>` UA
+            # on every request, which passes the allowlist, so no extra UA
+            # config is needed on our side — same as the MiniMax path. The
+            # gateway serves a single model id (`kimi-for-coding`), so we
+            # pin the model when we take this route (the canvas writes
+            # shapes like `moonshot:kimi-k2` / `kimi-coding/kimi-k2` that
+            # the gateway rejects).
+            compatibility = "openai"
+            if api_key and api_key.startswith("sk-cp-") and "minimaxi.com" in provider_url:
+                logger.info(
+                    "Detected sk-cp- claude-proxy token for native-Minimax route; "
+                    "switching to Minimax Anthropic-compat endpoint "
+                    "(api.minimax.io/anthropic)"
+                )
+                provider_url = "https://api.minimax.io/anthropic"
+                compatibility = "anthropic"
+            elif api_key and api_key.startswith("sk-kimi-") and "moonshot.ai" in provider_url:
+                logger.info(
+                    "Detected sk-kimi- Kimi-For-Coding token for native-Moonshot "
+                    "route; switching to Kimi Anthropic-compat endpoint "
+                    "(api.kimi.com/coding, model kimi-for-coding)"
+                )
+                provider_url = "https://api.kimi.com/coding"
+                compatibility = "anthropic"
+                model = "kimi-for-coding"
 
         # 3. Run non-interactive onboard
         if not os.path.exists(os.path.expanduser("~/.openclaw/openclaw.json")):
