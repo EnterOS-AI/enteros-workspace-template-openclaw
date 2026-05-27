@@ -102,6 +102,14 @@ jobs:
       - if: hashFiles('requirements.txt') == ''
         run: pip install -q molecule-ai-workspace-runtime
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: Adapter platform-routing unit tests
+        # Scoped to the platform-routing test this PR adds. The rest of tests/
+        # (test_model_fallback, test_session_id_derivation) is NOT wired to CI
+        # yet and has pre-existing failures against the published runtime —
+        # fixing/enabling those is a separate cleanup, out of scope here.
+        run: |
+          pip install -q pytest
+          python3 -m pytest tests/test_platform_routing.py -q
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
         run: |
