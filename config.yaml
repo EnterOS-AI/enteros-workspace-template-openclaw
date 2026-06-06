@@ -2,6 +2,68 @@ name: OpenClaw Agent
 description: OpenClaw framework — multi-file prompt system with SOUL, BOOTSTRAP, AGENTS, TOOLS, and HEARTBEAT modules
 version: 1.0.0
 tier: 2
+
+# Provider registry — declarative SSOT mirroring adapter.py's
+# OPENCLAW_PROVIDERS dict (the runtime authority used by
+# resolve_provider_routing). Encoding the same taxonomy in YAML lets
+# workspace-server (cp#220 hard-gate) and the canvas Config tab
+# validate / surface providers without parsing Python.
+#
+# Adding a new provider here = also add it to OPENCLAW_PROVIDERS in
+# adapter.py (model_prefix → (auth_env_vars, base_url)), and (if
+# cp#220 v1 still applies) extend KnownProviderNames() in
+# molecule-controlplane userdata_containerized.go. Track that under
+# SSOT audit comment 40629 finding #4.
+#
+# Model-id format is `<provider>:<vendor-model-id>` (colon-separated,
+# NOT slash-separated like hermes — matches adapter.py's `prefix, _,
+# _ = model_str.partition(":")` split). See coerce_servable_model for
+# the resolution path.
+#
+# Schema per entry:
+#   name           : provider prefix (the substring before `:` in a
+#                    model id, e.g. `minimax` for `minimax:MiniMax-M2.7`).
+#                    1:1 with OPENCLAW_PROVIDERS keys.
+#   base_url       : default OpenAI-compat endpoint OpenClaw points the
+#                    custom-provider profile at. Tracked for parity
+#                    with adapter.py — the runtime may rewrite this
+#                    on the fly when an sk-cp-* token is detected
+#                    (see resolve_provider_routing's minimax/moonshot
+#                    branches that re-aim at api.minimax.io/anthropic
+#                    and api.kimi.com/coding respectively).
+#   auth_env       : env vars accepted; ANY ONE being set satisfies
+#                    auth (OR-semantics).
+providers:
+  - name: openai
+    base_url: https://api.openai.com/v1
+    auth_env: [OPENAI_API_KEY]
+
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    auth_env: [GROQ_API_KEY]
+
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    auth_env: [OPENROUTER_API_KEY]
+
+  - name: qianfan
+    base_url: https://qianfan.baidubce.com/v2
+    auth_env: [QIANFAN_API_KEY, AISTUDIO_API_KEY]
+
+  - name: minimax
+    # Native registry URL. adapter.py's resolve_provider_routing
+    # rewrites to https://api.minimax.io/anthropic when the supplied
+    # key starts with sk-cp- (token-plan via Anthropic-compat shim),
+    # so this base_url is the keyed-vendor default, not a hard pin.
+    base_url: https://api.minimaxi.com/v1
+    auth_env: [MINIMAX_API_KEY]
+
+  - name: moonshot
+    # adapter.py rewrites to https://api.kimi.com/coding when an
+    # sk-kimi-* key is detected — see resolve_provider_routing.
+    base_url: https://api.moonshot.ai/v1
+    auth_env: [KIMI_API_KEY]
+
 runtime: openclaw
 # Default model — must mirror adapter.py OPENCLAW_DEFAULT_MODEL. minimax
 # is in OPENCLAW_PROVIDERS AND MINIMAX_API_KEY is the credential a fresh
