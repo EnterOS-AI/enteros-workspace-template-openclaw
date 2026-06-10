@@ -253,10 +253,10 @@ jobs:
           # Each matrix leg reads its own environment's CP admin token. Both
           # secrets must be configured on this repo's CI (or org-wide) for the
           # respective promote to run: CP_ADMIN_API_TOKEN (prod) and
-          # CP_ADMIN_API_TOKEN_STAGING (staging — a STAGING control-plane admin
+          # CP_STAGING_ADMIN_API_TOKEN (staging — a STAGING control-plane admin
           # token). Same secret names the claude-code/hermes templates use.
           PROD_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
-          STAGING_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN_STAGING }}
+          STAGING_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
           ENV_NAME: ${{ matrix.env_name }}
           CP_HOST: ${{ matrix.cp_host }}
           TEMPLATE_NAME: openclaw
@@ -269,7 +269,7 @@ jobs:
             TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN"
           else
             CP_ADMIN_API_TOKEN="${STAGING_TOKEN}"
-            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN_STAGING"
+            TOKEN_SECRET_NAME="CP_STAGING_ADMIN_API_TOKEN"
           fi
           if [ -z "${CP_ADMIN_API_TOKEN}" ]; then
             echo "::error::${TOKEN_SECRET_NAME} secret not configured on this repo — cannot promote ${ENV_NAME} pin"
