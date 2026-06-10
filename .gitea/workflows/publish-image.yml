@@ -81,6 +81,10 @@ jobs:
     runs-on: [publish, release]
     timeout-minutes: 30
     needs: resolve-version
+    # Surface the Push step's digest at job level so the promote-pin job can
+    # consume `needs.publish.outputs.digest` across the `needs:` edge.
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -186,6 +190,7 @@ jobs:
           echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
 
       - name: Push image to ECR (post-smoke)
+        id: push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
@@ -201,3 +206,94 @@ jobs:
             org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — openclaw runtime
+
+
+  promote-pin:
+    # RFC internal#529 Layer A — auto-promote the just-pushed digest to
+    # runtime_image_pins via the control-plane admin endpoint, so existing
+    # tenants actually pick up the new image instead of staying pinned to the
+    # old digest. Without this job the publish job builds + pushes :latest/:sha
+    # to ECR but the prod (and staging) runtime_image_pins never move — the
+    # silent-stale-pin gap this PR closes. Mirrors the claude-code / codex /
+    # hermes sibling templates which already promote.
+    #
+    # Gitea has no reliable `workflow_run`, so promotion is a job in THIS same
+    # workflow (not a separate workflow listening on publish success). Gated on
+    # `if: success() && github.ref == 'refs/heads/main'` so a failed publish
+    # (smoke red / push red) or a non-main run never bumps any pin — promotion
+    # only ever runs AFTER a green build/push on main.
+    #
+    # Dual-environment fan-out: staging CP runtime_image_pins is a SEPARATE
+    # SSOT from prod, so the `E2E Staging SaaS` canary boots whatever staging's
+    # pin points at. We promote to BOTH prod (api.moleculesai.app) and staging
+    # (staging-api.moleculesai.app).
+    #
+    # Per-target ISOLATION: `strategy.fail-fast: false` makes each matrix leg
+    # independent — a prod-promote failure does NOT cancel the staging-promote
+    # and vice-versa. Each leg is fail-LOUD on a non-2xx for ITS OWN target so a
+    # stranded pin is never hidden behind a green workflow.
+    name: Promote runtime_image_pins (CP admin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [resolve-version, publish]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: prod
+            cp_host: api.moleculesai.app
+          - env_name: staging
+            cp_host: staging-api.moleculesai.app
+    steps:
+      - name: POST /cp/admin/runtime-image/promote (${{ matrix.env_name }})
+        env:
+          # Each matrix leg reads its own environment's CP admin token. Both
+          # secrets must be configured on this repo's CI (or org-wide) for the
+          # respective promote to run: CP_ADMIN_API_TOKEN (prod) and
+          # CP_ADMIN_API_TOKEN_STAGING (staging — a STAGING control-plane admin
+          # token). Same secret names the claude-code/hermes templates use.
+          PROD_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+          STAGING_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN_STAGING }}
+          ENV_NAME: ${{ matrix.env_name }}
+          CP_HOST: ${{ matrix.cp_host }}
+          TEMPLATE_NAME: openclaw
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+          GIT_SHA: ${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${ENV_NAME}" = "prod" ]; then
+            CP_ADMIN_API_TOKEN="${PROD_TOKEN}"
+            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN"
+          else
+            CP_ADMIN_API_TOKEN="${STAGING_TOKEN}"
+            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN_STAGING"
+          fi
+          if [ -z "${CP_ADMIN_API_TOKEN}" ]; then
+            echo "::error::${TOKEN_SECRET_NAME} secret not configured on this repo — cannot promote ${ENV_NAME} pin"
+            exit 1
+          fi
+          if [ -z "${IMAGE_DIGEST}" ]; then
+            echo "::error::publish digest is empty — Push step did not expose digest"
+            exit 1
+          fi
+          body=$(printf '{"template_name":"%s","image_digest":"%s","git_sha":"%s","notes":"auto-promote via publish-image.yml @ %s -> %s"}' \
+            "${TEMPLATE_NAME}" "${IMAGE_DIGEST}" "${GIT_SHA}" "${GITHUB_SHA}" "${ENV_NAME}")
+          echo "::notice::POST runtime-image/promote env=${ENV_NAME} host=${CP_HOST} template=${TEMPLATE_NAME} digest=${IMAGE_DIGEST} git_sha=${GIT_SHA}"
+          resp=$(mktemp)
+          code=$(curl -sS -o "${resp}" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${CP_ADMIN_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${body}" \
+            "https://${CP_HOST}/cp/admin/runtime-image/promote")
+          echo "HTTP ${code}"
+          cat "${resp}"
+          echo
+          if [ "${code}" != "200" ] && [ "${code}" != "201" ]; then
+            echo "::error::${ENV_NAME} promote failed (HTTP ${code})"
+            exit 1
+          fi
+          echo "::notice::${ENV_NAME} runtime_image_pins.${TEMPLATE_NAME} bumped to ${IMAGE_DIGEST}"
