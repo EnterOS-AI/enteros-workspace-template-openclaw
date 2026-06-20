@@ -15,6 +15,21 @@ name: CI
 
 on: [push, pull_request]
 
+# Defense-in-depth de-dup ONLY (the t4-conformance unique-name fix is the
+# actual fail-closed primitive against the shared-host-daemon race; see
+# that job). Scope per workflow + ref + EVENT so the push run and the
+# pull_request run of the same internal-PR commit get DISTINCT groups —
+# they must both complete (each emits its own required-status context;
+# feedback_gitea_gate_check_required_list_not_combined_status). Never
+# per-SHA-global: that silently cross-cancels legit required checks
+# (feedback_concurrency_group_per_sha). cancel-in-progress:false so an
+# in-flight live T4 probe is never aborted mid-assertion (a cancelled
+# privileged probe would look like a gate failure / flake); a newer push
+# to the same ref+event simply queues behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
   PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
