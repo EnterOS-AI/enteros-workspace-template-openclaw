@@ -110,4 +110,61 @@ fi
 # ANTHROPIC_BASE_URL still wins as the escape hatch for regional
 # endpoints.
 
+# --- npm auth for the private @molecule-ai scope (gitea read:package) -----
+# The org-management MCP a CONCIERGE declares (molecule-platform-mcp) is launched
+# at runtime via `npx -y @molecule-ai/mcp-server`. That package is PRIVATE on the
+# gitea npm registry, so without a scoped `_authToken` npx 404s/ETARGETs it and
+# the MCP never starts — the concierge boots without create_workspace (the
+# fleet-wide "degraded concierge" root cause, runtime #176). OpenClaw itself is
+# a PUBLIC npm package (installed in adapter.py), so this auth is needed ONLY for
+# the private molecule-platform-mcp at runtime.
+#
+# Ported from template-codex/start.sh (which mirrors runtime #176
+# `npm_auth.install_npm_gitea_auth()`: ~/.npmrc = scope→gitea registry +
+# `_authToken` from the SAME gitea token, SSOT). We prefer the runtime helper
+# when the installed base provides it; otherwise write ~/.npmrc directly so an
+# older base image still gets a launchable MCP. The token comes from
+# MOLECULE_TEMPLATE_REPO_TOKEN (the read-only gitea PAT widened to read:package,
+# runtime #176 prereq); never echoed. We are already the uid-1000 agent here
+# (post-gosu), so ~/.npmrc resolves to /home/agent/.npmrc, read by the npx the
+# runtime invokes.
+NPM_GITEA_BASE="${MOLECULE_GITEA_BASE_URL:-https://git.moleculesai.app}"
+NPM_GITEA_TOKEN="${MOLECULE_TEMPLATE_REPO_TOKEN:-${GITEA_TOKEN:-}}"
+if [ -n "${NPM_GITEA_TOKEN}" ]; then
+  RUNTIME_PY=""
+  for cand in /opt/molecule-venv/bin/python3 /opt/molecule-venv/bin/python python3 python; do
+    if command -v "$cand" >/dev/null 2>&1; then RUNTIME_PY="$cand"; break; fi
+  done
+  _wrote_npmrc=""
+  if [ -n "$RUNTIME_PY" ] && \
+     "$RUNTIME_PY" -c "import molecule_runtime.npm_auth" >/dev/null 2>&1; then
+    # Preferred: the runtime SSOT helper (runtime #176). We are already agent.
+    if MOLECULE_GITEA_BASE_URL="$NPM_GITEA_BASE" \
+       MOLECULE_TEMPLATE_REPO_TOKEN="$NPM_GITEA_TOKEN" \
+       "$RUNTIME_PY" -c \
+       "import molecule_runtime.npm_auth as n; n.install_npm_gitea_auth()" \
+       >/dev/null 2>&1; then
+      _wrote_npmrc="runtime-helper"
+    fi
+  fi
+  if [ -z "$_wrote_npmrc" ]; then
+    # Fallback: write ~/.npmrc directly. Gitea npm registry path is
+    # /api/packages/<owner>/npm/. The @molecule-ai scope → owner molecule-ai.
+    NPM_REGISTRY="${NPM_GITEA_BASE%/}/api/packages/molecule-ai/npm/"
+    # Strip scheme for the //host/path:_authToken key gitea/npm expects.
+    NPM_REGISTRY_NOSCHEME="${NPM_REGISTRY#https:}"
+    NPM_REGISTRY_NOSCHEME="${NPM_REGISTRY_NOSCHEME#http:}"
+    NPMRC="${HOME:-/home/agent}/.npmrc"
+    {
+      printf '@molecule-ai:registry=%s\n' "$NPM_REGISTRY"
+      printf '%s:_authToken=%s\n' "$NPM_REGISTRY_NOSCHEME" "$NPM_GITEA_TOKEN"
+    } > "$NPMRC"
+    chmod 0600 "$NPMRC" 2>/dev/null || true
+    _wrote_npmrc="direct"
+  fi
+  echo "[entrypoint.sh] npm gitea auth configured (@molecule-ai scope, ${_wrote_npmrc}); npx @molecule-ai/mcp-server can resolve the private package"
+else
+  echo "[entrypoint.sh] WARN: no MOLECULE_TEMPLATE_REPO_TOKEN/GITEA_TOKEN — npx @molecule-ai/mcp-server (management MCP) will ETARGET the private package" >&2
+fi
+
 exec molecule-runtime "$@"

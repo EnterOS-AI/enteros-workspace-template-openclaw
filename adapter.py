@@ -80,6 +80,47 @@ OPENCLAW_DEFAULT_MODEL = "minimax:MiniMax-M2.7"
 OPENCLAW_PLATFORM_DEFAULT_MODEL = "moonshot/kimi-k2.6"
 
 
+def _parse_tools_list_body(body: str) -> list[str]:
+    """Extract tool names from a JSON-RPC ``tools/list`` response body.
+
+    Tolerant of the three framings an MCP server may use over stdio/http:
+    a single JSON object, newline-delimited JSON (one object per line, the
+    stdio default), and SSE (``data: {…}`` lines). Returns the names under
+    ``result.tools[].name`` from whichever frame carries them; [] if none.
+    The core#3082 producer keys on these names (``mcp__<server>__<name>``).
+    """
+    candidates: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            line = line[len("data:"):].strip()
+        if not (line.startswith("{") or line.startswith("[")):
+            continue
+        candidates.append(line)
+    # Also try the whole body as one JSON document (single-object http reply).
+    stripped = body.strip()
+    if stripped and stripped not in candidates:
+        candidates.append(stripped)
+
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+        except ValueError:
+            continue
+        result = data.get("result") if isinstance(data, dict) else None
+        tools = result.get("tools") if isinstance(result, dict) else None
+        if isinstance(tools, list):
+            names = [
+                t["name"] for t in tools
+                if isinstance(t, dict) and isinstance(t.get("name"), str) and t.get("name")
+            ]
+            if names:
+                return names
+    return []
+
+
 def resolve_platform_routing(model_str, env):
     """When the workspace runs in platform_managed LLM billing, route through
     the Molecule platform proxy's OpenAI-compat surface, bypassing the
@@ -471,6 +512,28 @@ class OpenClawAdapter(BaseAdapter):
         # ced1e6b2-b680-4314-816d-2d0cf6b12f71.
         await self._setup_molecule_mcp()
 
+        # 4c. Install DECLARED plugins via the base per-runtime pipeline (P4).
+        #
+        # Until now this template called the plugin pipeline ZERO times — a dead
+        # pipeline. The single hardcoded `_setup_molecule_mcp` above wires only
+        # the in-process A2A peer-discovery sidecar (`molecule`, HTTP); it does
+        # NOT consume any plugin the org DECLARES in config.yaml. The privileged
+        # org-management MCP (`molecule-platform-mcp` → `@molecule-ai/mcp-server`,
+        # the create_workspace / org-admin tooling a CONCIERGE needs) is delivered
+        # as a declared plugin, so without this call an openclaw concierge boots
+        # with peer-discovery but NO management MCP — exactly the cross-runtime
+        # gap P4 closes.
+        #
+        # `install_plugins_via_registry` is the LOOP over declared MCP plugins:
+        # for each one it resolves MCPServerAdaptor (runtime-agnostic) →
+        # register_mcp_server_hook (our openclaw override below) →
+        # mcp_render.render_for_runtime("openclaw", …), which writes the stdio
+        # descriptor into ~/.openclaw/openclaw.json `mcp.servers.<name>` (the file
+        # `openclaw mcp set` mutates and the gateway re-reads at start in step 5).
+        # A privileged-plugin failure raises PrivilegedPluginInstallError so a
+        # management-MCP-less concierge fails CLOSED + loudly rather than silent.
+        await self._install_declared_mcp_plugins(config)
+
         # 5. Start the gateway as a background process
         gateway_port = config.runtime_config.get("gateway_port", OPENCLAW_PORT)
         logger.info(f"Starting OpenClaw gateway on port {gateway_port}...")
@@ -635,6 +698,143 @@ class OpenClawAdapter(BaseAdapter):
                 "scope grant will be applied lazily by execute() fallback"
             )
 
+        # 7. Publish the LOADED MCP tool inventory for the core#3082 gate.
+        #
+        # The platform online/degraded gate (core#3082) wants proof the
+        # management MCP's tools were ACTUALLY LOADED (not merely declared). We
+        # report the INVENTORY — the tools the registered MCP servers EXPOSE,
+        # enumerated once here after the gateway is healthy — NOT the tools the
+        # model happened to invoke in a turn. That distinction is the #142/#3082-
+        # class bug the fleet just RC'd on codex's per-turn producer: a healthy
+        # turn that calls no MCP tool publishes [] and DEGRADES a healthy
+        # concierge. An inventory taken from the live server can't false-empty on
+        # a tool-less turn. Fail-soft: an enumeration failure publishes nothing
+        # (stays None → fail-closed degraded), never a guessed/static list and
+        # never an exception into boot.
+        await self._publish_loaded_mcp_inventory()
+
+    async def _publish_loaded_mcp_inventory(self):
+        """Enumerate the tools the registered MCP servers EXPOSE and publish them
+        to the core#3082 ``loaded_mcp_tools`` producer (inventory, not per-turn).
+
+        Reads the registered servers from ~/.openclaw/openclaw.json
+        (``mcp.servers``) and, for each STDIO server, runs a one-shot
+        ``initialize`` + ``tools/list`` JSON-RPC handshake against the SAME
+        command openclaw spawns to get the ground-truth tool list. Publishes the
+        union as ``mcp__<server>__<tool>`` ids (matching the prefix the gate
+        consumes). HTTP servers (the a2a `molecule` sidecar) are enumerated over
+        their URL. Best-effort: any failure leaves the producer at its prior
+        value (None until proven), so the gate stays fail-closed rather than
+        seeing a guessed list.
+        """
+        try:
+            from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+        except Exception:  # pragma: no cover — older base image without the producer
+            return
+
+        oc_config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+        try:
+            with open(oc_config_path) as _f:
+                servers = (json.load(_f).get("mcp") or {}).get("servers") or {}
+        except (OSError, ValueError) as e:
+            logger.debug("loaded_mcp_tools: could not read openclaw.json: %s", e)
+            return
+        if not isinstance(servers, dict) or not servers:
+            return
+
+        tool_ids: list[str] = []
+        for server_name, spec in servers.items():
+            if not isinstance(spec, dict):
+                continue
+            try:
+                names = await self._list_mcp_tools(spec)
+            except Exception as e:  # noqa: BLE001 — best-effort enumeration
+                logger.debug("loaded_mcp_tools: enumerate %r failed: %s", server_name, e)
+                names = []
+            for tool in names:
+                tool_ids.append(f"mcp__{server_name}__{tool}")
+
+        if not tool_ids:
+            # Nothing enumerated — do NOT publish a guessed/empty list; leave the
+            # producer at None so the gate stays fail-closed (degraded) until a
+            # real inventory is observed (matches the producer contract).
+            logger.info(
+                "loaded_mcp_tools: no MCP tools enumerated from %d registered "
+                "server(s); leaving producer unset (gate stays fail-closed)",
+                len(servers),
+            )
+            return
+        try:
+            set_loaded_mcp_tools(sorted(set(tool_ids)))
+            logger.info(
+                "loaded_mcp_tools: published %d-tool inventory from %d server(s)",
+                len(set(tool_ids)), len(servers),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("loaded_mcp_tools: publish failed: %s", e)
+
+    async def _list_mcp_tools(self, spec: dict) -> list[str]:
+        """One-shot ``initialize`` + ``tools/list`` against a registered MCP
+        server, returning the tool names it exposes. Supports the stdio
+        (``{command, args?, env?}``) and http (``{type:http, url}``) shapes
+        openclaw stores. Returns [] on any failure (caller logs)."""
+        init_req = {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "openclaw-inventory", "version": "1"},
+            },
+        }
+        list_req = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+
+        url = spec.get("url")
+        if url:
+            # HTTP transport (the a2a sidecar). Enumerate over the URL.
+            import urllib.request
+            tools: list[str] = []
+            for req_body in (init_req, list_req):
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(req_body).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    body = resp.read().decode(errors="replace")
+                if req_body is list_req:
+                    tools = _parse_tools_list_body(body)
+            return tools
+
+        command = spec.get("command")
+        if not command:
+            return []
+        args = spec.get("args") or []
+        child_env = os.environ.copy()
+        child_env.setdefault("PATH", f"{os.path.expanduser('~/.local/bin')}:/usr/local/bin:/usr/bin:/bin")
+        child_env.update({k: str(v) for k, v in (spec.get("env") or {}).items()})
+
+        proc = await asyncio.create_subprocess_exec(
+            command, *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=child_env,
+        )
+        # Newline-delimited JSON-RPC over stdio: send initialize + tools/list,
+        # close stdin, read all stdout. A one-shot enumeration, then the child
+        # exits at EOF — we don't keep this process (openclaw owns the real one).
+        payload = (json.dumps(init_req) + "\n" + json.dumps(list_req) + "\n").encode()
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(payload), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return []
+        return _parse_tools_list_body(stdout.decode(errors="replace"))
+
     async def _setup_molecule_mcp(self):
         """Start the molecule A2A MCP server (HTTP transport) as a
         supervised sidecar and register it with OpenClaw.
@@ -727,6 +927,68 @@ class OpenClawAdapter(BaseAdapter):
                 f"{result.stderr.strip() or result.stdout.strip()}"
             )
         logger.info("Registered molecule MCP server with OpenClaw")
+
+    async def _install_declared_mcp_plugins(self, config: AdapterConfig):
+        """Drive the base per-runtime plugin pipeline for declared plugins (P4).
+
+        Loads plugins from the per-workspace dir (+ shared fallback) and runs
+        ``install_plugins_via_registry``. For an MCP-server plugin (the privileged
+        ``molecule-platform-mcp`` a concierge declares) this resolves
+        MCPServerAdaptor → ``register_mcp_server_hook`` (overridden below) →
+        ``mcp_render.render_for_runtime("openclaw", …)``, rendering the
+        ``[mcp.servers.<name>]`` stdio entry into ~/.openclaw/openclaw.json.
+
+        Mirrors the codex adapter's identical call from its own setup(). Without
+        it the declared management MCP is NEVER written for openclaw, so the
+        concierge boots without create_workspace (the #3159 class of bug — here:
+        not wired at all). A PrivilegedPluginInstallError propagates so a
+        management-MCP-less concierge fails closed + loudly.
+        """
+        from molecule_runtime.plugins import load_plugins
+
+        workspace_plugins_dir = os.path.join(config.config_path, "plugins")
+        plugins = load_plugins(
+            workspace_plugins_dir=workspace_plugins_dir,
+            shared_plugins_dir=os.environ.get("PLUGINS_DIR", "/plugins"),
+        )
+        if plugins.plugin_names:
+            logger.info("openclaw: installing declared plugins: %s",
+                        ", ".join(plugins.plugin_names))
+        await self.install_plugins_via_registry(config, plugins)
+
+    def register_mcp_server_hook(self, config, name, spec):
+        """OpenClaw MCP-wiring PORT override: inject molecule-* env literals.
+
+        The base hook dispatches on ``self.name() == "openclaw"`` to
+        ``mcp_render.render_openclaw_config``, which writes the stdio descriptor
+        into ~/.openclaw/openclaw.json ``mcp.servers.<name>`` — the same on-disk
+        shape ``openclaw mcp set`` produces. OpenClaw spawns each stdio MCP server
+        as a child and passes the descriptor's ``env`` block to it. The management
+        MCP (``@molecule-ai/mcp-server``) reads MOLECULE_CP_URL + MOLECULE_ADMIN_
+        TOKEN to reach the controlplane; if they aren't in the descriptor's env,
+        create_workspace 401s/no-ops even though the server is declared. So we
+        resolve those values at install time and merge them as LITERALS into the
+        spec's ``env`` before the renderer writes the file — the exact pattern the
+        codex adapter uses for its config.toml env sub-table. Descriptor-declared
+        keys (e.g. MOLECULE_MCP_MODE) win and are never overwritten.
+        """
+        spec = dict(spec)
+        descriptor_env = dict(spec.get("env") or {})
+        for key in (
+            "MOLECULE_CP_URL",
+            "MOLECULE_ADMIN_TOKEN",
+            "PLATFORM_URL",
+            "WORKSPACE_ID",
+            "MOLECULE_ORG_ID",
+        ):
+            if key in descriptor_env:
+                continue
+            val = os.environ.get(key)
+            if val:
+                descriptor_env[key] = val
+        if descriptor_env:
+            spec["env"] = descriptor_env
+        return super().register_mcp_server_hook(config, name, spec)
 
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
         return OpenClawA2AExecutor(heartbeat=config.heartbeat)
