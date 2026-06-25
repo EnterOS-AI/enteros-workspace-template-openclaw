@@ -50,6 +50,87 @@ OPENCLAW_MCP_HTTP_PORT = 9100
 # Known missing optional deps in OpenClaw's npm package
 OPENCLAW_MISSING_DEPS = ["@buape/carbon", "@larksuiteoapi/node-sdk", "@slack/web-api", "grammy"]
 
+# OpenClaw-native MCP config — ~/.openclaw/openclaw.json  mcp.servers.<name>.
+# This is the file `openclaw mcp set <name> '<json>'` mutates (verified against
+# openclaw@2026.5.7): the stdio descriptor ({command, args?, env?}) nested under
+# mcp.servers.<name>. The adapter renders this file DIRECTLY (see
+# ``_render_openclaw_mcp`` / ``register_mcp_server_hook``) rather than dispatching
+# to the runtime base's ``render_for_runtime`` — the openclaw branch of which is
+# a deliberate fail-loud ``NotImplementedError`` stub on runtime versions that
+# predate the openclaw renderer. Owning the format here keeps the management-MCP
+# install path working on every pinned runtime and makes the present-reader agree
+# with what we wrote (the RCA#2970 gate's "is the management MCP wired?" probe).
+OPENCLAW_MCP_PARENT = "mcp"
+OPENCLAW_MCP_SERVERS = "servers"
+
+
+def _openclaw_config_path() -> str:
+    """Absolute path to ~/.openclaw/openclaw.json, resolved at CALL time.
+
+    Resolved per-call (not frozen at import) so it tracks $HOME — matching the
+    runtime's own ``_openclaw_path`` and the rest of this adapter, which all read
+    ``os.path.expanduser("~/.openclaw/...")`` at use time."""
+    return os.path.expanduser("~/.openclaw/openclaw.json")
+
+
+# Canonical name of the privileged org-management MCP, sourced from the runtime
+# so the adapter's present-reader matches the exact server name the RCA#2970 gate
+# probes for. Falls back to the literal on older runtimes lacking the symbol.
+try:
+    from molecule_runtime.platform_agent_identity import (
+        MANAGEMENT_MCP_NAME as MANAGEMENT_MCP_NAME,
+    )
+except Exception:  # pragma: no cover — older runtime without the constant
+    MANAGEMENT_MCP_NAME = "molecule-platform"
+
+
+def _load_openclaw_config(path: str) -> dict:
+    """Read ~/.openclaw/openclaw.json as a dict; {} on missing/malformed."""
+    try:
+        with open(path) as _f:
+            data = json.load(_f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _render_openclaw_mcp(config_path: str, name: str, spec: dict) -> None:
+    """Additively merge ``name -> spec`` into ~/.openclaw/openclaw.json's
+    ``mcp.servers`` map. Idempotent; preserves every other key + server.
+
+    Produces the exact on-disk shape ``openclaw mcp set <name> '<json>'`` writes
+    (the stdio descriptor under ``mcp.servers.<name>``). Written directly rather
+    than shelling out so it works before the openclaw binary is on PATH and is
+    pure/testable — mirrors the runtime's own ``render_openclaw_config``.
+    """
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    data = _load_openclaw_config(config_path)
+    mcp = data.get(OPENCLAW_MCP_PARENT)
+    if not isinstance(mcp, dict):
+        mcp = {}
+    servers = mcp.get(OPENCLAW_MCP_SERVERS)
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[name] = dict(spec)
+    mcp[OPENCLAW_MCP_SERVERS] = servers
+    data[OPENCLAW_MCP_PARENT] = mcp
+    with open(config_path, "w") as _f:
+        _f.write(json.dumps(data, indent=2) + "\n")
+
+
+def _openclaw_mcp_present(config_path: str, name: str) -> bool:
+    """True when ~/.openclaw/openclaw.json declares ``mcp.servers.<name>``.
+
+    Fail-closed by construction: a missing, unreadable, malformed, or
+    structurally-unexpected config yields False, so a genuinely MCP-less openclaw
+    concierge stays fail-closed (degraded) at the RCA#2970 gate."""
+    data = _load_openclaw_config(config_path)
+    mcp = data.get(OPENCLAW_MCP_PARENT)
+    if not isinstance(mcp, dict):
+        return False
+    servers = mcp.get(OPENCLAW_MCP_SERVERS)
+    return isinstance(servers, dict) and name in servers
+
 # This template's declared default model — mirrors config.yaml's `model:`
 # field. Two hard constraints (both required; routability alone is NOT
 # enough — that gap is the second root cause this default fixes):
@@ -957,20 +1038,32 @@ class OpenClawAdapter(BaseAdapter):
         await self.install_plugins_via_registry(config, plugins)
 
     def register_mcp_server_hook(self, config, name, spec):
-        """OpenClaw MCP-wiring PORT override: inject molecule-* env literals.
+        """OpenClaw MCP-wiring PORT override: render the openclaw-native config.
 
-        The base hook dispatches on ``self.name() == "openclaw"`` to
-        ``mcp_render.render_openclaw_config``, which writes the stdio descriptor
-        into ~/.openclaw/openclaw.json ``mcp.servers.<name>`` — the same on-disk
-        shape ``openclaw mcp set`` produces. OpenClaw spawns each stdio MCP server
-        as a child and passes the descriptor's ``env`` block to it. The management
-        MCP (``@molecule-ai/mcp-server``) reads MOLECULE_CP_URL + MOLECULE_ADMIN_
-        TOKEN to reach the controlplane; if they aren't in the descriptor's env,
+        Writes the stdio descriptor into ~/.openclaw/openclaw.json
+        ``mcp.servers.<name>`` — the same on-disk shape ``openclaw mcp set``
+        produces — NOT ``.claude/settings.json`` (the #3159 mis-attribution where
+        an openclaw concierge's management MCP is rendered into, and judged
+        against, a file its runtime never reads).
+
+        We render DIRECTLY here rather than delegating to the base hook's
+        ``mcp_render.render_for_runtime("openclaw", …)``: that dispatch is a
+        deliberate fail-loud ``NotImplementedError`` stub on runtime versions that
+        predate the openclaw renderer (format-unverified, phase P4), which would
+        crash the management-MCP install on any not-yet-graduated runtime even
+        though we DO know the format. Owning the renderer in the template keeps the
+        install path working across pinned runtime versions and keeps it byte-shape
+        identical to the runtime's own ``render_openclaw_config``.
+
+        OpenClaw spawns each stdio MCP server as a child and passes the
+        descriptor's ``env`` block to it. The management MCP
+        (``@molecule-ai/mcp-server``) reads MOLECULE_CP_URL + MOLECULE_ADMIN_TOKEN
+        to reach the controlplane; if they aren't in the descriptor's env,
         create_workspace 401s/no-ops even though the server is declared. So we
         resolve those values at install time and merge them as LITERALS into the
-        spec's ``env`` before the renderer writes the file — the exact pattern the
-        codex adapter uses for its config.toml env sub-table. Descriptor-declared
-        keys (e.g. MOLECULE_MCP_MODE) win and are never overwritten.
+        spec's ``env`` before writing — the exact pattern the codex adapter uses
+        for its config.toml env sub-table. Descriptor-declared keys (e.g.
+        MOLECULE_MCP_MODE) win and are never overwritten.
         """
         spec = dict(spec)
         descriptor_env = dict(spec.get("env") or {})
@@ -988,7 +1081,28 @@ class OpenClawAdapter(BaseAdapter):
                 descriptor_env[key] = val
         if descriptor_env:
             spec["env"] = descriptor_env
-        return super().register_mcp_server_hook(config, name, spec)
+        config_path = _openclaw_config_path()
+        _render_openclaw_mcp(config_path, name, spec)
+        logger.info(
+            "register_mcp_server_hook: wired MCP %r into %s (runtime=openclaw)",
+            name, config_path,
+        )
+
+    def management_mcp_present(self, config) -> bool:
+        """True when the privileged management MCP is wired into openclaw's native
+        config (~/.openclaw/openclaw.json ``mcp.servers``).
+
+        Runtime-agnostic answer to the RCA#2970 online gate's "is the management
+        MCP wired?" probe, judged against the file openclaw actually reads rather
+        than a Claude settings.json it never reads (#3159). Overrides the base —
+        which dispatches to the runtime's present-reader — for the same reason
+        ``register_mcp_server_hook`` does: on runtimes predating the openclaw
+        renderer the base present-reader reports False even after we wrote the
+        file, disagreeing with what the renderer produced.
+
+        Fail-closed by construction (a missing/malformed config yields False), so
+        a genuinely MCP-less concierge stays degraded at the gate."""
+        return _openclaw_mcp_present(_openclaw_config_path(), MANAGEMENT_MCP_NAME)
 
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
         return OpenClawA2AExecutor(heartbeat=config.heartbeat)
