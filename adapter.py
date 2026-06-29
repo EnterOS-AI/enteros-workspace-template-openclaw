@@ -149,16 +149,34 @@ def _openclaw_mcp_present(config_path: str, name: str) -> bool:
 #     and aborted setup() before the platform MCP was ever registered —
 #     bricking list_peers on every default-config provision.
 #
-# ``minimax:MiniMax-M2.7`` satisfies both: ``minimax`` is in
-# OPENCLAW_PROVIDERS and its key ``MINIMAX_API_KEY`` is the one fresh
-# openclaw workspaces actually have. The adapter's existing sk-cp-*
-# routing override (step 2b) then steers it onto MiniMax's
-# Anthropic-compat endpoint. It is already a declared, key-consistent
-# entry in config.yaml's runtime_config.models.
-OPENCLAW_DEFAULT_MODEL = "minimax:MiniMax-M2.7"
+# THE single shared platform-default model is the Infisical SSOT
+# ``MOLECULE_LLM_DEFAULT_MODEL`` (/shared/controlplane/llm), read at import. The
+# literal below is only the LAST-RESORT fallback when that env is unset, and it
+# matches the CP/core ``platformDefaultModelFallback`` (minimax/MiniMax-M2.7).
+#
+# Both forms below now derive from the SAME shared value, removing the prior
+# divergence where the BYOK default was MiniMax but the platform default was Kimi
+# (moonshot/kimi-k2.6) — a fresh platform_managed openclaw and a fresh BYOK
+# openclaw now resolve the SAME default, never two different vendors. ``minimax``
+# is in OPENCLAW_PROVIDERS and ``MINIMAX_API_KEY`` is the credential a fresh
+# openclaw workspace actually has (the seeded ``custom-api-minimaxi-com`` sk-cp-*
+# provider; the step-2b routing override steers it to MiniMax's Anthropic-compat
+# endpoint), so the colon-form default is key-consistent on first boot.
+def _ssot_default_model(sep: str) -> str:
+    raw = (os.environ.get("MOLECULE_LLM_DEFAULT_MODEL") or "").strip()
+    if not raw:
+        raw = "minimax/MiniMax-M2.7"  # shared fallback == CP/core platformDefaultModelFallback
+    # openclaw's BYOK registry namespaces as ``<provider>:<model>`` (colon); the
+    # platform proxy uses ``<vendor>/<model>`` (slash). Normalise to the form the
+    # caller needs WITHOUT changing the model identity.
+    return raw.replace("/", ":", 1) if sep == ":" else raw.replace(":", "/", 1)
 
-# Platform-managed LLM default (slash form the proxy resolves to Moonshot/Kimi).
-OPENCLAW_PLATFORM_DEFAULT_MODEL = "moonshot/kimi-k2.6"
+
+# BYOK colon-form default for the per-vendor registry (coerce_servable_model).
+OPENCLAW_DEFAULT_MODEL = _ssot_default_model(":")
+
+# Platform-managed slash-form default for the proxy (resolve_platform_routing).
+OPENCLAW_PLATFORM_DEFAULT_MODEL = _ssot_default_model("/")
 
 
 def _parse_tools_list_body(body: str) -> list[str]:
