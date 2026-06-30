@@ -1132,6 +1132,11 @@ class OpenClawAdapter(BaseAdapter):
         for key in (
             "MOLECULE_CP_URL",
             "MOLECULE_ADMIN_TOKEN",
+            "MOLECULE_API_URL",
+            "MOLECULE_API_KEY",
+            "MOLECULE_ORG_API_KEY",
+            "MOLECULE_ORG_SLUG",
+            "MOLECULE_AUDIT_ACTOR",
             "PLATFORM_URL",
             "WORKSPACE_ID",
             "MOLECULE_ORG_ID",
