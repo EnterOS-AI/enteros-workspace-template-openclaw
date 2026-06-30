@@ -77,22 +77,20 @@ jobs:
           fi
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-  # pc2-safe: false — needs docker (ECR login + buildx + push); routes to the
-  # dedicated Linux publish runners only.
-  #
-  # task #390 B-lite + internal#597: pin to `[publish, release]` (NOT
-  # `ubuntu-latest`). The `ubuntu-latest` label is advertised by BOTH the
-  # Linux operator-host runners AND the Windows/WSL hongming-pc-runner-*
-  # runners (PC2). A docker build/push job landing on PC2 fails with
-  # "Failed to initialize: protocol not available" (npipe→Linux-container
-  # bridging gap). Only molecule-runner-publish-{1,2} advertise BOTH
-  # `publish` and `release`, so the array form excludes the WSL pair
-  # while keeping the dedicated Linux publish runners — matching the
-  # sibling claude-code / codex / hermes templates which already use
-  # [publish, release].
   publish:
     name: Build & push workspace-template-openclaw image
-    runs-on: [publish, release]
+    # CF-bypass (Cloudflare 413): this job PUSHES the 1.7-2.4GB image to the
+    # Gitea OCI registry. registry.moleculesai.app is Cloudflare-fronted with a
+    # ~100MB request-body cap, so a monolithic blob PUT of the layers 413s. The
+    # push therefore has to run on a runner CO-LOCATED with the local Gitea,
+    # where `localhost:3200` is the host's registry port and docker login/push
+    # execute against the HOST docker daemon (this runner mounts the host
+    # /var/run/docker.sock; act_runner docker_host = that sock). The local
+    # `ci-meta` runner satisfies this. The dedicated remote `[publish, release]`
+    # runners CANNOT reach the host's localhost:3200 (verified: `docker login
+    # localhost:3200` -> dial tcp 127.0.0.1:3200: connection refused), so they
+    # must not run this job while the registry is served locally + CF-fronted.
+    runs-on: ci-meta
     timeout-minutes: 30
     needs: resolve-version
     # Surface the Push step's digest at job level so the promote-pin job can
