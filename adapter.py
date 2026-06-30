@@ -228,10 +228,18 @@ def resolve_platform_routing(model_str, env):
     so the registry path would raise "No API key found".
 
     Provider selection is flag-free — ``platform`` is selected the same way any
-    other provider is, by the resolved provider, NOT by a billing-mode env:
-      * ``LLM_PROVIDER``/``MODEL_PROVIDER`` env == ``platform`` (core injects
-        ``LLM_PROVIDER=platform`` for platform-routed workspaces, the same
-        signal the runtime resolver consumes), or
+    other provider is, by the resolved provider, NOT by a billing-mode env.
+
+    ``MOLECULE_RESOLVED_PROVIDER`` is the SSOT signal and the TOP-PRECEDENCE
+    explicit provider: core's provisioner resolves the provider ONCE (Go
+    ``manifest.DeriveProvider``) and publishes the registry arm name here for
+    every layer to READ, never re-derive. When it is set it is authoritative —
+    ``platform`` is selected iff its value is exactly ``platform``; any other
+    (byok) arm means NOT platform and the model namespace must NOT re-promote it
+    to platform. Only when the SSOT signal is ABSENT do we fall back to the
+    legacy signals (back-compat for old provisioners):
+      * ``LLM_PROVIDER``/``MODEL_PROVIDER`` env == ``platform`` (core injected
+        ``LLM_PROVIDER=platform`` for platform-routed workspaces), or
       * a ``platform/`` / ``platform:`` model namespace marker.
 
     Returns (api_key, provider_url, model, compatibility) or None when the
@@ -245,12 +253,22 @@ def resolve_platform_routing(model_str, env):
     smoke (molecule-controlplane scripts/e2e-llm-kimi-smoke.sh).
     """
     model = (model_str or "").strip()
-    env_provider = (env.get("LLM_PROVIDER") or env.get("MODEL_PROVIDER") or "").strip().lower()
-    is_platform = (
-        env_provider == "platform"
-        or model.startswith("platform/")
-        or model.startswith("platform:")
-    )
+    resolved = (env.get("MOLECULE_RESOLVED_PROVIDER") or "").strip().lower()
+    if resolved:
+        # SSOT signal present: it is authoritative (top precedence). Route
+        # platform iff the resolved arm name is exactly ``platform``; any other
+        # arm is BYOK and must NOT be re-derived from LLM_PROVIDER/MODEL_PROVIDER
+        # or the model namespace.
+        is_platform = (resolved == "platform")
+    else:
+        # Back-compat: no SSOT signal — fall back to the legacy LLM_PROVIDER/
+        # MODEL_PROVIDER env or the ``platform/`` / ``platform:`` model marker.
+        env_provider = (env.get("LLM_PROVIDER") or env.get("MODEL_PROVIDER") or "").strip().lower()
+        is_platform = (
+            env_provider == "platform"
+            or model.startswith("platform/")
+            or model.startswith("platform:")
+        )
     if not is_platform:
         return None
     base = env.get("MOLECULE_LLM_BASE_URL") or env.get("OPENAI_BASE_URL")

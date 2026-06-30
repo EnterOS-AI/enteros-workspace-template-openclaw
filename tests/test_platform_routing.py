@@ -98,3 +98,52 @@ def test_fail_closed_when_platform_unconfigured():
         adapter.resolve_platform_routing(
             "moonshot/kimi-k2.6", {"LLM_PROVIDER": "platform"}
         )
+
+
+# --- SSOT signal: MOLECULE_RESOLVED_PROVIDER (TOP PRECEDENCE) ---------------
+# Core's provisioner resolves the provider ONCE and publishes the registry arm
+# name here. When set it is authoritative: platform iff value == "platform";
+# any other arm is BYOK and must NOT be re-derived from LLM_PROVIDER/MODEL_
+# PROVIDER or the model namespace. Only when ABSENT do the legacy signals apply.
+
+def test_resolved_provider_platform_routes_to_proxy():
+    env = {
+        "MOLECULE_RESOLVED_PROVIDER": "platform",
+        "MOLECULE_LLM_BASE_URL": PROXY,
+        "MOLECULE_LLM_USAGE_TOKEN": "tok-ssot",
+    }
+    key, url, model, compat = adapter.resolve_platform_routing("moonshot/kimi-k2.6", env)
+    assert (key, url, model, compat) == ("tok-ssot", PROXY, "moonshot/kimi-k2.6", "openai")
+
+
+def test_resolved_provider_byok_arm_is_not_platform():
+    # The SSOT signal names a byok arm -> not platform, even though LLM_PROVIDER
+    # and the model namespace would otherwise (legacy) say platform. The SSOT
+    # value wins; resolve_platform_routing returns None so the BYOK colon
+    # registry path runs.
+    env = {
+        "MOLECULE_RESOLVED_PROVIDER": "minimax",
+        "LLM_PROVIDER": "platform",
+        "MOLECULE_LLM_BASE_URL": PROXY,
+        "MOLECULE_LLM_USAGE_TOKEN": "tok",
+    }
+    assert adapter.resolve_platform_routing("platform/moonshot/kimi-k2.6", env) is None
+
+
+def test_resolved_provider_absent_falls_back_to_legacy_signal():
+    # No SSOT signal -> legacy LLM_PROVIDER=platform still selects platform.
+    env = {
+        "LLM_PROVIDER": "platform",
+        "MOLECULE_LLM_BASE_URL": PROXY,
+        "MOLECULE_LLM_USAGE_TOKEN": "tok",
+    }
+    assert adapter.resolve_platform_routing("moonshot/kimi-k2.6", env) is not None
+
+
+def test_resolved_provider_platform_fail_closed_when_unconfigured():
+    # SSOT signal == platform but proxy env unset -> fail closed (no keyless
+    # BYOK fall-through), same invariant as the legacy-signal path.
+    with pytest.raises(RuntimeError):
+        adapter.resolve_platform_routing(
+            "moonshot/kimi-k2.6", {"MOLECULE_RESOLVED_PROVIDER": "platform"}
+        )
