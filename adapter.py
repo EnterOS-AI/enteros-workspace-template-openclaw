@@ -542,12 +542,15 @@ class OpenClawAdapter(BaseAdapter):
         #
         # The probe matches the SAME wire shape the gateway will use:
         #  - anthropic-compat routes -> POST {base}/v1/messages with
-        #    `anthropic-version` + `x-api-key`. For the Kimi-For-Coding
-        #    gateway we ALSO send a `claude-cli/*` User-Agent, because
-        #    that endpoint 403s non-coding-agent UAs — probing with the
-        #    same UA openclaw's Anthropic shim sends proves end-to-end
-        #    reachability (auth AND the UA allowlist), not just network.
+        #    `anthropic-version` + `x-api-key`.
         #  - openai-compat routes -> POST {base}/chat/completions.
+        # ALL routes send a coding-agent `User-Agent` (set just before the
+        # request is built). The CP proxy is Cloudflare-fronted and the default
+        # `Python-urllib/*` UA trips Cloudflare's browser-integrity rule (403,
+        # edge error 1010) — and the Kimi-For-Coding gateway 403s non-coding-
+        # agent UAs too. Mirroring the UA the real gateway sends proves
+        # end-to-end reachability (auth AND the edge/UA allowlist), not just
+        # network, and stops a false 403 from bricking a working concierge.
         try:
             import urllib.request as _urlreq
             import urllib.error as _urlerr
@@ -558,10 +561,6 @@ class OpenClawAdapter(BaseAdapter):
                     "x-api-key": api_key,
                     "content-type": "application/json",
                 }
-                # Kimi-For-Coding gates on a coding-agent UA; openclaw's
-                # Anthropic SDK shim sends claude-cli/* so we mirror it.
-                if "api.kimi.com" in provider_url:
-                    _probe_headers["user-agent"] = "claude-cli/1.0 (molecule-openclaw boot-probe)"
                 _probe_body = json.dumps({
                     "model": model.split(":", 1)[-1],
                     "max_tokens": 1,
@@ -580,6 +579,15 @@ class OpenClawAdapter(BaseAdapter):
                     "max_tokens": 1,
                     "messages": [{"role": "user", "content": "ping"}],
                 }).encode()
+            # The CP LLM proxy sits behind Cloudflare. Cloudflare's browser-
+            # integrity edge rule 403s a default `Python-urllib/*` User-Agent
+            # with error 1010 — a BROWSER-SIGNATURE ban, NOT an LLM-auth failure.
+            # Without a real UA this fail-closed probe bricks the concierge even
+            # though the gateway's own traffic (Node / claude-cli UA) is served
+            # fine. Send the SAME coding-agent UA the real gateway uses so the
+            # probe traverses the identical edge path the live traffic will (this
+            # also satisfies the Kimi-For-Coding coding-agent-UA allowlist).
+            _probe_headers.setdefault("user-agent", "claude-cli/1.0 (molecule-openclaw boot-probe)")
             _req = _urlreq.Request(_probe_url, data=_probe_body, headers=_probe_headers, method="POST")
             try:
                 with _urlreq.urlopen(_req, timeout=10) as _resp:
@@ -591,9 +599,10 @@ class OpenClawAdapter(BaseAdapter):
                         f"Upstream auth smoke probe rejected the configured key at "
                         f"{_probe_url} (HTTP {_he.code}). The provider credential and "
                         f"provider_url={provider_url} are incompatible "
-                        f"(HTTP 403 on api.kimi.com also indicates a blocked "
-                        f"User-Agent). Fix the secret or the routing override in "
-                        f"adapter.py before this workspace can chat."
+                        f"(a 403 may also be a Cloudflare edge UA ban — error "
+                        f"1010 — or, on api.kimi.com, a blocked User-Agent). Fix "
+                        f"the secret or the routing override in adapter.py before "
+                        f"this workspace can chat."
                     )
                 logger.warning(
                     f"Upstream auth smoke probe non-fatal failure at {_probe_url}: "
