@@ -221,33 +221,49 @@ def _parse_tools_list_body(body: str) -> list[str]:
 
 
 def resolve_platform_routing(model_str, env):
-    """When the workspace runs in platform_managed LLM billing, route through
+    """When the workspace's resolved provider is ``platform``, route through
     the Molecule platform proxy's OpenAI-compat surface, bypassing the
-    per-vendor colon registry (resolve_provider_routing) entirely — in this
-    mode the tenant has no BYOK key (the workspace-server strips them), so the
-    registry path would raise "No API key found".
+    per-vendor colon registry (resolve_provider_routing) entirely — for the
+    platform arm the tenant has no BYOK key (the workspace-server strips them),
+    so the registry path would raise "No API key found".
 
-    Returns (api_key, provider_url, model, compatibility) or None when not
-    platform_managed. Raises RuntimeError if platform_managed but unconfigured
-    (fail closed rather than fall through to a keyless registry route).
+    Provider selection is flag-free — ``platform`` is selected the same way any
+    other provider is, by the resolved provider, NOT by a billing-mode env:
+      * ``LLM_PROVIDER``/``MODEL_PROVIDER`` env == ``platform`` (core injects
+        ``LLM_PROVIDER=platform`` for platform-routed workspaces, the same
+        signal the runtime resolver consumes), or
+      * a ``platform/`` / ``platform:`` model namespace marker.
 
-    The model id is sent verbatim (a leading "platform/" namespace marker is
-    stripped); the proxy keys on the vendor prefix (moonshot/..., minimax/...,
-    anthropic/..., openai/...). Mirrors the proven smoke
-    (molecule-controlplane scripts/e2e-llm-kimi-smoke.sh).
+    Returns (api_key, provider_url, model, compatibility) or None when the
+    resolved provider is not ``platform``. Raises RuntimeError if it IS
+    platform but the proxy env is unconfigured (fail closed rather than fall
+    through to a keyless registry route).
+
+    The model id is sent verbatim (a leading "platform/" / "platform:"
+    namespace marker is stripped); the proxy keys on the vendor prefix
+    (moonshot/..., minimax/..., anthropic/..., openai/...). Mirrors the proven
+    smoke (molecule-controlplane scripts/e2e-llm-kimi-smoke.sh).
     """
-    if env.get("MOLECULE_LLM_BILLING_MODE") != "platform_managed":
+    model = (model_str or "").strip()
+    env_provider = (env.get("LLM_PROVIDER") or env.get("MODEL_PROVIDER") or "").strip().lower()
+    is_platform = (
+        env_provider == "platform"
+        or model.startswith("platform/")
+        or model.startswith("platform:")
+    )
+    if not is_platform:
         return None
     base = env.get("MOLECULE_LLM_BASE_URL") or env.get("OPENAI_BASE_URL")
     token = env.get("MOLECULE_LLM_USAGE_TOKEN") or env.get("ANTHROPIC_API_KEY")
     if not base or not token:
         raise RuntimeError(
-            "platform_managed LLM billing but MOLECULE_LLM_BASE_URL / usage token "
-            "is unset — refusing to fall back to a keyless BYOK route"
+            "resolved provider is `platform` but MOLECULE_LLM_BASE_URL / usage "
+            "token is unset — refusing to fall back to a keyless BYOK route"
         )
-    model = (model_str or "").strip()
     if model.startswith("platform/"):
         model = model[len("platform/"):]
+    elif model.startswith("platform:"):
+        model = model[len("platform:"):]
     if not model:
         model = OPENCLAW_PLATFORM_DEFAULT_MODEL
     return token, base, model, "openai"
@@ -369,10 +385,11 @@ class OpenClawAdapter(BaseAdapter):
         # from the shared runtime's load_config) reach a registry that has
         # no `anthropic` entry — that bricks fresh provisions. See
         # coerce_servable_model for the full rationale.
-        # Platform-managed billing short-circuits the per-vendor colon
-        # registry: route everything through the Molecule proxy. Checked
-        # BEFORE resolve_provider_routing, which would raise on the
-        # stripped-key (no-BYOK) platform environment.
+        # A resolved provider of `platform` short-circuits the per-vendor
+        # colon registry: route everything through the Molecule proxy. Selected
+        # by provider==platform (LLM_PROVIDER/model namespace), NOT a
+        # billing-mode env. Checked BEFORE resolve_provider_routing, which would
+        # raise on the stripped-key (no-BYOK) platform environment.
         _pm = resolve_platform_routing(config.model, os.environ)
         if _pm is not None:
             api_key, provider_url, model, compatibility = _pm

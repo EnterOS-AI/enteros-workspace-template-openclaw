@@ -1,10 +1,14 @@
-"""Unit tests for adapter.resolve_platform_routing — the platform-managed
-LLM routing override.
+"""Unit tests for adapter.resolve_platform_routing — the platform provider
+routing override.
 
-In platform_managed billing the tenant has no BYOK key (the workspace-server
-strips them), so the per-vendor colon registry (resolve_provider_routing)
-would raise "No API key found". resolve_platform_routing short-circuits that:
-route everything through the Molecule proxy's OpenAI-compat surface.
+Selection is flag-free: routing kicks in when the resolved provider is
+``platform`` (``LLM_PROVIDER=platform`` — core injects this for platform-routed
+workspaces — or a ``platform/``/``platform:`` model namespace), NOT a
+``MOLECULE_LLM_BILLING_MODE`` env. For the platform arm the tenant has no BYOK
+key (the workspace-server strips them), so the per-vendor colon registry
+(resolve_provider_routing) would raise "No API key found".
+resolve_platform_routing short-circuits that: route everything through the
+Molecule proxy's OpenAI-compat surface.
 
 adapter.py is loaded by tests/conftest.py straight from the repo root; its
 top-level imports require molecule_runtime. If that's unavailable the module
@@ -26,17 +30,20 @@ if adapter is None:
 PROXY = "https://api.moleculesai.app/api/v1/internal/llm/openai/v1"
 
 
-def test_not_platform_managed_returns_none():
-    # byok / unset -> no override; the colon registry path runs as before.
+def test_not_platform_returns_none():
+    # provider != platform / unset -> no override; the colon registry path
+    # runs as before. A bare vendor model with no platform signal is BYOK.
     assert adapter.resolve_platform_routing("minimax:MiniMax-M2.7", {}) is None
     assert adapter.resolve_platform_routing(
-        "moonshot:kimi-k2.6", {"MOLECULE_LLM_BILLING_MODE": "byok"}
+        "moonshot:kimi-k2.6", {"LLM_PROVIDER": "minimax"}
     ) is None
 
 
-def test_platform_routes_to_proxy_openai_surface():
+def test_platform_provider_routes_to_proxy_openai_surface():
+    # provider==platform via LLM_PROVIDER (the signal core injects for
+    # platform-routed workspaces) selects the platform arm.
     env = {
-        "MOLECULE_LLM_BILLING_MODE": "platform_managed",
+        "LLM_PROVIDER": "platform",
         "MOLECULE_LLM_BASE_URL": PROXY,
         "MOLECULE_LLM_USAGE_TOKEN": "tok-123",
     }
@@ -44,9 +51,19 @@ def test_platform_routes_to_proxy_openai_surface():
     assert (key, url, model, compat) == ("tok-123", PROXY, "moonshot/kimi-k2.6", "openai")
 
 
-def test_platform_prefix_is_stripped():
+def test_model_provider_legacy_alias_also_selects_platform():
     env = {
-        "MOLECULE_LLM_BILLING_MODE": "platform_managed",
+        "MODEL_PROVIDER": "platform",
+        "MOLECULE_LLM_BASE_URL": PROXY,
+        "MOLECULE_LLM_USAGE_TOKEN": "t",
+    }
+    assert adapter.resolve_platform_routing("moonshot/kimi-k2.6", env) is not None
+
+
+def test_platform_model_namespace_selects_platform_and_is_stripped():
+    # A "platform/" model namespace marker is itself the provider==platform
+    # signal — no env needed — and the marker is stripped for the proxy.
+    env = {
         "MOLECULE_LLM_BASE_URL": PROXY,
         "MOLECULE_LLM_USAGE_TOKEN": "t",
     }
@@ -56,7 +73,7 @@ def test_platform_prefix_is_stripped():
 
 def test_empty_model_falls_back_to_platform_default():
     env = {
-        "MOLECULE_LLM_BILLING_MODE": "platform_managed",
+        "LLM_PROVIDER": "platform",
         "MOLECULE_LLM_BASE_URL": PROXY,
         "MOLECULE_LLM_USAGE_TOKEN": "t",
     }
@@ -66,7 +83,7 @@ def test_empty_model_falls_back_to_platform_default():
 
 def test_openai_base_url_and_anthropic_token_fallbacks():
     env = {
-        "MOLECULE_LLM_BILLING_MODE": "platform_managed",
+        "LLM_PROVIDER": "platform",
         "OPENAI_BASE_URL": PROXY,
         "ANTHROPIC_API_KEY": "sk-ant-xx",
     }
@@ -75,9 +92,9 @@ def test_openai_base_url_and_anthropic_token_fallbacks():
 
 
 def test_fail_closed_when_platform_unconfigured():
-    # platform_managed but no base/token -> raise, do NOT fall back to a
+    # provider==platform but no base/token -> raise, do NOT fall back to a
     # keyless BYOK route.
     with pytest.raises(RuntimeError):
         adapter.resolve_platform_routing(
-            "moonshot/kimi-k2.6", {"MOLECULE_LLM_BILLING_MODE": "platform_managed"}
+            "moonshot/kimi-k2.6", {"LLM_PROVIDER": "platform"}
         )
