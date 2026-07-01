@@ -84,7 +84,7 @@ RUN pip install --no-cache-dir \
       pip install --no-cache-dir --upgrade \
         --index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_EXTRA_INDEX_URL}" \
-        "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
+        "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
 COPY adapter.py .
