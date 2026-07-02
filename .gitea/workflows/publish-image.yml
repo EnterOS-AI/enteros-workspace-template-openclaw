@@ -253,15 +253,15 @@ jobs:
     # (smoke red / push red) or a non-main run never bumps any pin — promotion
     # only ever runs AFTER a green build/push on main.
     #
-    # Dual-environment fan-out: staging CP runtime_image_pins is a SEPARATE
-    # SSOT from prod, so the `E2E Staging SaaS` canary boots whatever staging's
-    # pin points at. We promote to BOTH prod (api.moleculesai.app) and staging
-    # (staging-api.moleculesai.app).
+    # staging CP runtime_image_pins is a SEPARATE SSOT from prod, so the
+    # `E2E Staging SaaS` canary boots whatever staging's pin points at. We
+    # promote to staging (staging-api.moleculesai.app). The prod leg is
+    # currently de-required under the prod-freeze (see the matrix comment
+    # below).
     #
-    # Per-target ISOLATION: `strategy.fail-fast: false` makes each matrix leg
-    # independent — a prod-promote failure does NOT cancel the staging-promote
-    # and vice-versa. Each leg is fail-LOUD on a non-2xx for ITS OWN target so a
-    # stranded pin is never hidden behind a green workflow.
+    # Per-target ISOLATION: `strategy.fail-fast: false` keeps each matrix leg
+    # independent and fail-LOUD on a non-2xx for ITS OWN target so a stranded
+    # pin is never hidden behind a green workflow.
     name: Promote runtime_image_pins (CP admin)
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -273,8 +273,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - env_name: prod
-            cp_host: api.moleculesai.app
+          # prod leg removed (prod-freeze). Prod cutover is pending-operator and
+          # the prod CP admin bearer is not provisioned to match any token these
+          # template repos hold, so POST /cp/admin/runtime-image/promote to
+          # api.moleculesai.app returns HTTP 401 by design (AdminGate constant-
+          # time bearer compare, internal/auth/middleware.go). Auto-promoting to
+          # prod during the freeze is exactly what the freeze prohibits, so this
+          # leg is de-required rather than papered over. Restore the prod include
+          # once prod cutover completes and a matching prod CP admin token is
+          # provisioned. Staging stays the live promote target.
           - env_name: staging
             cp_host: staging-api.moleculesai.app
     steps:
