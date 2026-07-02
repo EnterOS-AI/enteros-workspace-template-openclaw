@@ -11,14 +11,20 @@ idle-cap path, a genuinely-working long turn with no native events would be
 falsely killed at the idle-cap.
 
 ``_communicate_touching_lease`` closes that gap by draining stdout/stderr
-incrementally and calling ``turn_lease.touch_current()`` on every chunk
-(source D: subprocess-output liveness). These tests assert:
+incrementally and calling ``_lease_touch()`` (turn-lease source D:
+subprocess-output liveness) on every chunk. These tests assert:
   1. the lease is touched on each chunk of subprocess output,
   2. the full output (incl. the final JSON envelope) is still captured, and
-  3. a hung child is killed and ``asyncio.TimeoutError`` re-raised on timeout.
+  3. a hung child is killed and ``asyncio.TimeoutError`` re-raised on timeout,
+  4. and the helper is safe when the runtime predates the mailbox kernel
+     (``_turn_lease is None`` -> ``_lease_touch``/``_lease_reset`` no-op).
 
-Soft-skips when molecule_runtime is not installed (adapter not importable) —
-the same posture as the canonical validator and the other openclaw tests.
+The tests monkeypatch the adapter's own ``_lease_touch`` indirection rather than
+``molecule_runtime.turn_lease`` directly, so they run on runtime wheels that
+predate the mailbox kernel too (the template pins the runtime ``>=0.3.11`` and
+must support both). Soft-skips when molecule_runtime is not installed (adapter
+not importable) — the same posture as the canonical validator / the other
+openclaw tests.
 """
 from __future__ import annotations
 
@@ -50,10 +56,8 @@ _HANG_CHILD = "import time\nwhile True: time.sleep(1)\n"
 @pytest.mark.asyncio
 async def test_communicate_touches_lease_per_chunk_and_captures_output(monkeypatch):
     """Each chunk of child output renews the lease; full output is captured."""
-    from molecule_runtime import turn_lease
-
     touches = {"n": 0}
-    monkeypatch.setattr(turn_lease, "touch_current", lambda: touches.__setitem__("n", touches["n"] + 1))
+    monkeypatch.setattr(adapter, "_lease_touch", lambda: touches.__setitem__("n", touches["n"] + 1))
 
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", _EMIT_CHILD,
@@ -73,9 +77,7 @@ async def test_communicate_touches_lease_per_chunk_and_captures_output(monkeypat
 @pytest.mark.asyncio
 async def test_communicate_kills_and_reraises_on_timeout(monkeypatch):
     """A hung child is killed (no leak) and TimeoutError re-raised on timeout."""
-    from molecule_runtime import turn_lease
-
-    monkeypatch.setattr(turn_lease, "touch_current", lambda: None)
+    monkeypatch.setattr(adapter, "_lease_touch", lambda: None)
 
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", _HANG_CHILD,
@@ -92,12 +94,14 @@ async def test_communicate_kills_and_reraises_on_timeout(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_touch_current_is_noop_safe_when_kernel_off():
-    """With no lease installed (mailbox kernel off) the helper still works —
-    turn_lease.touch_current() is a no-op, so behaviour equals communicate()."""
-    from molecule_runtime import turn_lease
+async def test_lease_helpers_noop_when_runtime_predates_kernel(monkeypatch):
+    """When the runtime has no turn_lease (older wheel), _lease_touch/_lease_reset
+    are safe no-ops and the subprocess drain still captures output."""
+    monkeypatch.setattr(adapter, "_turn_lease", None)
+    # Must not raise even though no lease module is present.
+    adapter._lease_touch()
+    adapter._lease_reset()
 
-    turn_lease.install(None)  # ensure no lease is installed (kernel-off shape)
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", "import sys; sys.stdout.write('ok')",
         stdout=asyncio.subprocess.PIPE,

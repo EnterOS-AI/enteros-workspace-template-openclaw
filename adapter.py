@@ -26,6 +26,33 @@ except ModuleNotFoundError:  # pragma: no cover - older local runtime
         return text
 from a2a.server.agent_execution import AgentExecutor
 
+# Turn-lease liveness (MUST-FIX 1) is provided by the mailbox-kernel runtime.
+# GUARDED: the template's requirements pin molecule-ai-workspace-runtime>=0.3.11,
+# and wheels predating the mailbox kernel do not ship molecule_runtime.turn_lease
+# — so a hard `from molecule_runtime import turn_lease` would break every turn on
+# an older runtime. Import it optionally; _lease_touch/_lease_reset below no-op
+# when it is absent (or when the kernel is off / no lease installed), so the
+# adapter runs unchanged on old runtimes and renews the lease on new ones.
+try:
+    from molecule_runtime import turn_lease as _turn_lease
+except Exception:  # pragma: no cover - older runtime wheel without the mailbox kernel
+    _turn_lease = None
+
+
+def _lease_reset() -> None:
+    """Arm the process-global turn lease at turn start. No-op when the runtime
+    predates the mailbox kernel (turn_lease absent) or no lease is installed."""
+    if _turn_lease is not None:
+        _turn_lease.reset_current()
+
+
+def _lease_touch() -> None:
+    """Renew the process-global turn lease (turn-lease source D). No-op when the
+    runtime predates the mailbox kernel or no lease is installed."""
+    if _turn_lease is not None:
+        _turn_lease.touch_current()
+
+
 logger = logging.getLogger(__name__)
 
 # Providers supported by this adapter; maps prefix → (auth_env_vars, default_base_url).
@@ -1202,8 +1229,6 @@ async def _communicate_touching_lease(proc, *, timeout):
     ``asyncio.TimeoutError`` is re-raised so the caller's existing timeout
     branch is unchanged.
     """
-    from molecule_runtime import turn_lease
-
     out = bytearray()
     err = bytearray()
 
@@ -1216,8 +1241,9 @@ async def _communicate_touching_lease(proc, *, timeout):
                 break
             sink.extend(chunk)
             # Source D: incremental subprocess output renews the lease. No-op
-            # when no lease is installed (mailbox kernel off).
-            turn_lease.touch_current()
+            # when no lease is installed (mailbox kernel off) or the runtime
+            # predates the mailbox kernel.
+            _lease_touch()
 
     async def _drain_and_wait():
         await asyncio.gather(_pump(proc.stdout, out), _pump(proc.stderr, err))
@@ -1273,11 +1299,10 @@ class OpenClawA2AExecutor(AgentExecutor):
         # OpenClaw runs its whole turn inside a single blocking `openclaw agent`
         # subprocess and never enters the native runtime's astream/idle-cap +
         # on_tool_start/end lease-touch path, so without this the lease is never
-        # reset per turn. No-op when the mailbox kernel is off (no lease
-        # installed). The lease is then renewed on subprocess output (source D)
+        # reset per turn. No-op when the mailbox kernel is off / the runtime
+        # predates it. The lease is then renewed on subprocess output (source D)
         # by _communicate_touching_lease below.
-        from molecule_runtime import turn_lease
-        turn_lease.reset_current()
+        _lease_reset()
 
         # Derive a STABLE session id for openclaw's native SessionManager
         # (pi-embedded-runner/run/attempt.ts:1655). Per RFC #600
