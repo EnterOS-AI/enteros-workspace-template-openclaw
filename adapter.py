@@ -1175,6 +1175,69 @@ class OpenClawAdapter(BaseAdapter):
         return OpenClawA2AExecutor(heartbeat=config.heartbeat)
 
 
+async def _communicate_touching_lease(proc, *, timeout):
+    """Drain ``proc``'s stdout+stderr to EOF while renewing the turn lease on
+    every chunk, then wait for exit. Drop-in for
+    ``asyncio.wait_for(proc.communicate(), timeout)`` returning
+    ``(stdout_bytes, stderr_bytes)``.
+
+    This is turn-lease SOURCE D (subprocess-output liveness): the OpenClaw
+    executor spawns ``openclaw agent`` as a subprocess and blocks on it, so it
+    never runs the native runtime's ``on_tool_start``/``on_tool_end`` lease
+    touches (source A) and openclaw does not write
+    ``MOLECULE_TOOL_ACTIVITY_FILE`` (source C) — leaving a long OpenClaw turn
+    with NO lease renewal. Any bytes the child emits on stdout/stderr are a
+    proxy for "still working", so each chunk calls ``turn_lease.touch_current()``
+    and keeps the lease fresh (up to its TTL / absolute cap). The plain
+    ``communicate()`` buffered ALL output until exit, so no incremental signal
+    ever reached the lease.
+
+    ``turn_lease.touch_current()`` is a no-op when the mailbox kernel is off (no
+    lease installed), so the default (non-kernel) flow is behaviourally
+    identical to ``communicate()`` — it just reads incrementally.
+
+    ``timeout`` is a wall-clock cap over the whole read+wait. On timeout the
+    child is killed (closing the leak the old ``wait_for(communicate())`` left —
+    it cancelled the read but left the process running) and
+    ``asyncio.TimeoutError`` is re-raised so the caller's existing timeout
+    branch is unchanged.
+    """
+    from molecule_runtime import turn_lease
+
+    out = bytearray()
+    err = bytearray()
+
+    async def _pump(stream, sink):
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            sink.extend(chunk)
+            # Source D: incremental subprocess output renews the lease. No-op
+            # when no lease is installed (mailbox kernel off).
+            turn_lease.touch_current()
+
+    async def _drain_and_wait():
+        await asyncio.gather(_pump(proc.stdout, out), _pump(proc.stderr, err))
+        await proc.wait()
+
+    try:
+        await asyncio.wait_for(_drain_and_wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:  # noqa: BLE001 — reaping the killed child must not mask the timeout
+            pass
+        raise
+    return bytes(out), bytes(err)
+
+
 class OpenClawA2AExecutor(AgentExecutor):
     """Proxies A2A messages to OpenClaw via `openclaw agent` CLI subprocess."""
 
@@ -1205,6 +1268,16 @@ class OpenClawA2AExecutor(AgentExecutor):
             return
 
         await set_current_task(self._heartbeat, brief_task(user_message))
+
+        # Arm the turn lease (MUST-FIX 1) at the start of this OpenClaw turn.
+        # OpenClaw runs its whole turn inside a single blocking `openclaw agent`
+        # subprocess and never enters the native runtime's astream/idle-cap +
+        # on_tool_start/end lease-touch path, so without this the lease is never
+        # reset per turn. No-op when the mailbox kernel is off (no lease
+        # installed). The lease is then renewed on subprocess output (source D)
+        # by _communicate_touching_lease below.
+        from molecule_runtime import turn_lease
+        turn_lease.reset_current()
 
         # Derive a STABLE session id for openclaw's native SessionManager
         # (pi-embedded-runner/run/attempt.ts:1655). Per RFC #600
@@ -1240,7 +1313,11 @@ class OpenClawA2AExecutor(AgentExecutor):
                     stderr=asyncio.subprocess.PIPE,
                     env={**os.environ, "PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}
                 )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=130)
+                # Renew the turn lease on every chunk of subprocess output
+                # (source D) so a genuinely-working long OpenClaw turn is not
+                # mistaken for a stall. Behaviourally identical to
+                # communicate() when the mailbox kernel is off.
+                stdout, stderr = await _communicate_touching_lease(proc, timeout=130)
                 output = stdout.decode().strip()
                 stderr_text = stderr.decode() if stderr else ""
 
