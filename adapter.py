@@ -26,6 +26,13 @@ except ModuleNotFoundError:  # pragma: no cover - older local runtime
         return text
 from a2a.server.agent_execution import AgentExecutor
 
+# Shared subprocess-executor base (tenant-agent BUG 3): the session+history
+# CONTRACT — history injection (build_task_text + extract_history) + a STABLE
+# WORKSPACE_ID-keyed session id — lives ONCE in the SSOT runtime SDK so every
+# subprocess runtime inherits it. OpenClawA2AExecutor below is a thin subclass
+# that provides ONLY the openclaw shell-out (run_agent) + MEDIA adornment.
+from molecule_runtime.subprocess_executor import SubprocessA2AExecutor
+
 # Turn-lease liveness (MUST-FIX 1) is provided by the mailbox-kernel runtime.
 # GUARDED: the template's requirements pin molecule-ai-workspace-runtime>=0.3.11,
 # and wheels predating the mailbox kernel do not ship molecule_runtime.turn_lease
@@ -1199,7 +1206,13 @@ class OpenClawAdapter(BaseAdapter):
         return _openclaw_mcp_present(_openclaw_config_path(), MANAGEMENT_MCP_NAME)
 
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
-        return OpenClawA2AExecutor(heartbeat=config.heartbeat)
+        # Pass the workspace identity so the shared base derives a STABLE,
+        # workspace-keyed session id (not the per-request context_id the a2a-sdk
+        # mints fresh each turn) — tenant-agent BUG 3.
+        return OpenClawA2AExecutor(
+            workspace_id=getattr(config, "workspace_id", "") or "",
+            heartbeat=config.heartbeat,
+        )
 
 
 async def _communicate_touching_lease(proc, *, timeout):
@@ -1264,19 +1277,29 @@ async def _communicate_touching_lease(proc, *, timeout):
     return bytes(out), bytes(err)
 
 
-class OpenClawA2AExecutor(AgentExecutor):
-    """Proxies A2A messages to OpenClaw via `openclaw agent` CLI subprocess."""
+class OpenClawA2AExecutor(SubprocessA2AExecutor):
+    """Shells A2A turns out to the ``openclaw agent`` CLI subprocess.
 
-    def __init__(self, heartbeat=None):
-        self._heartbeat = heartbeat
+    tenant-agent BUG 3: the session+history CONTRACT is INHERITED from
+    ``SubprocessA2AExecutor`` — conversation history is injected into the task
+    text (``build_task_text``) and the openclaw ``--session-id`` is derived from
+    the STABLE workspace identity (not the per-request ``context_id`` the a2a-sdk
+    mints fresh each turn). This class provides ONLY:
 
-    async def execute(self, context, event_queue):
-        from a2a.helpers import new_text_message
+      * ``_decorate_message`` — the openclaw ``MEDIA:`` image lines, and
+      * ``run_agent``         — the ``openclaw agent`` shell-out (+ turn-lease
+                                liveness + the scope-upgrade self-heal retry).
 
-        user_message = extract_message_text(context)
-        attached = extract_attached_files(getattr(context, "message", None))
-        if attached:
-            user_message = await append_image_descriptions(user_message, attached)
+    It MUST NOT override ``execute()``; the contract lives in the base and is
+    guarded by the shared contract test.
+    """
+
+    runtime_label = "OpenClaw"
+
+    def _decorate_message(self, user_message, attached):
+        # Surface image attachments to OpenClaw's media parser via MEDIA: lines.
+        # Runs before history is prepended by the base, so both the current
+        # media refs and the prior-turn transcript reach the CLI.
         image_media_lines = [
             f"MEDIA: {f['path']}"
             for f in attached
@@ -1284,17 +1307,11 @@ class OpenClawA2AExecutor(AgentExecutor):
         ]
         if image_media_lines:
             user_message = (
-                user_message.rstrip()
-                + "\n\n"
-                + "\n".join(image_media_lines)
+                user_message.rstrip() + "\n\n" + "\n".join(image_media_lines)
             ).strip()
+        return user_message
 
-        if not user_message:
-            await event_queue.enqueue_event(new_text_message("No message provided"))
-            return
-
-        await set_current_task(self._heartbeat, brief_task(user_message))
-
+    async def run_agent(self, task_text, session_id, context):
         # Arm the turn lease (MUST-FIX 1) at the start of this OpenClaw turn.
         # OpenClaw runs its whole turn inside a single blocking `openclaw agent`
         # subprocess and never enters the native runtime's astream/idle-cap +
@@ -1304,35 +1321,23 @@ class OpenClawA2AExecutor(AgentExecutor):
         # by _communicate_touching_lease below.
         _lease_reset()
 
-        # Derive a STABLE session id for openclaw's native SessionManager
-        # (pi-embedded-runner/run/attempt.ts:1655). Per RFC #600
-        # (https://git.moleculesai.app/molecule-ai/internal/issues/600):
-        # the platform must NOT ship message history; the agent owns the
-        # session by its own key. a2a-sdk semantics: context_id is the
-        # cross-turn conversation key (stable across messages in the same
-        # chat); task_id changes per task — so using task_id resets the
-        # openclaw session every turn, defeating native continuity.
-        # Fall back to task_id only if context_id is unset (legacy clients).
-        session_id = (
-            getattr(context, "context_id", None)
-            or getattr(context, "task_id", None)
-            or "default"
-        )
-
+        # task_text already carries the injected conversation history
+        # (base: build_task_text) and any MEDIA: lines (_decorate_message);
+        # session_id is the STABLE workspace-keyed key (base: derive_session_id).
+        #
         # Call OpenClaw agent via CLI, retrying once if we hit the
         # scope-upgrade-pending gate. The priming step in setup() should
         # cover steady-state, but openclaw can re-request scopes after
         # gateway restarts, session expiry, or a CLI version bump. The
-        # retry-with-approve here makes execute() self-healing so a
-        # single canvas message can recover from a stale pairing without
-        # needing a workspace restart.
+        # retry-with-approve here makes the turn self-healing so a single
+        # canvas message can recover from a stale pairing without a restart.
         reply = None
         try:
             for attempt in range(2):
                 proc = await asyncio.create_subprocess_exec(
                     "openclaw", "agent",
                     "--session-id", session_id,
-                    "--message", user_message,
+                    "--message", task_text,
                     "--json", "--timeout", "120",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -1425,15 +1430,9 @@ class OpenClawA2AExecutor(AgentExecutor):
 
         except asyncio.TimeoutError:
             reply = "OpenClaw timed out after 120s"
-        except Exception as e:
-            reply = f"OpenClaw error: {e}"
-        finally:
-            await set_current_task(self._heartbeat, "")
-
-        await event_queue.enqueue_event(new_text_message(reply))
-
-    async def cancel(self, context, event_queue):  # pragma: no cover
-        pass
+        # NOTE: any other exception propagates to the base execute(), which
+        # logs it and surfaces "OpenClaw error: <e>" as the reply.
+        return reply
 
 
 Adapter = OpenClawAdapter

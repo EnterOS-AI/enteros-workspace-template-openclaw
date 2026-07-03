@@ -1,23 +1,18 @@
-"""Regression test for the RFC #600 session-id derivation fix.
+"""Session-id derivation + history-injection regression tests (tenant-agent BUG 3).
 
-Before the fix, OpenClawA2AExecutor.execute() always passed
-``context.task_id or "default"`` as the openclaw CLI ``--session-id``.
+OpenClawA2AExecutor now INHERITS the session+history contract from the shared
+``SubprocessA2AExecutor`` base:
 
-In a2a-sdk v1, ``task_id`` changes per task (each inbound canvas turn is
-typically a fresh task), while ``context_id`` is the stable cross-turn
-conversation key. Using ``task_id`` means openclaw's native
-``SessionManager`` (pi-embedded-runner/run/attempt.ts:1655) opens a
-NEW session file every turn — defeating the whole point of having a
-persistent session store.
+  * the openclaw ``--session-id`` is derived from the STABLE workspace identity
+    (``workspace:<WORKSPACE_ID>``), NOT the per-request ``context_id`` the a2a-sdk
+    mints fresh each turn (using ``context_id`` opened a new native session every
+    message); ``context_id`` / ``task_id`` / ``"default"`` remain fallbacks only
+    when no WORKSPACE_ID is available; and
+  * conversation history from ``metadata.history`` is injected into the CLI
+    ``--message`` (``build_task_text``) so a 2nd turn keeps context.
 
-Per RFC #600
-(https://git.moleculesai.app/molecule-ai/internal/issues/600): the
-platform stops shipping ``messages_history``; the agent owns its own
-chat persistence. For that to work, the inbound dispatch MUST key the
-agent's session store on a stable identifier — context_id.
-
-These tests are import-level only (no openclaw CLI subprocess, no
-network) so they run cheap in CI on any runner.
+These tests capture the ``openclaw agent`` CLI args and assert on ``--session-id``
+and ``--message`` — no openclaw CLI subprocess, no network.
 """
 from __future__ import annotations
 
@@ -36,10 +31,34 @@ if "adapter" not in sys.modules:
 adapter = sys.modules["adapter"]
 
 
-def _build_context(*, task_id: str | None, context_id: str | None):
-    """Build a minimal RequestContext-shaped mock with the two id
-    attributes the execute() session-id derivation reads. message text
-    is irrelevant to this test — we patch the CLI invocation."""
+class _FakeStream:
+    """Minimal async byte stream for _communicate_touching_lease's _pump()."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self._sent = False
+
+    async def read(self, _n: int = -1) -> bytes:
+        if self._sent:
+            return b""
+        self._sent = True
+        return self._data
+
+
+class _FakeProc:
+    """Stands in for the openclaw subprocess. Supports the drain path the base
+    uses (proc.stdout/stderr .read() + proc.wait())."""
+
+    def __init__(self, stdout=b'{"result": {"payloads": [{"text": "ok"}]}}', stderr=b""):
+        self.returncode = 0
+        self.stdout = _FakeStream(stdout)
+        self.stderr = _FakeStream(stderr)
+
+    async def wait(self):
+        return self.returncode
+
+
+def _build_context(*, task_id, context_id, history=None):
     ctx = MagicMock()
     ctx.task_id = task_id
     ctx.context_id = context_id
@@ -50,196 +69,137 @@ def _build_context(*, task_id: str | None, context_id: str | None):
     msg.parts = [text_part]
     msg.metadata = None
     ctx.message = msg
+    # extract_history reads context.request.metadata / context.metadata.
+    ctx.request = SimpleNamespace(metadata={"history": history or []})
+    ctx.metadata = {"history": history or []}
     return ctx
 
 
-def _build_context_with_file(
-    *,
-    task_id: str | None,
-    context_id: str | None,
-    name: str,
-    mime_type: str,
-    path: str,
-):
-    ctx = _build_context(task_id=task_id, context_id=context_id)
-    file_obj = SimpleNamespace(uri=f"file://{path}", name=name, mimeType=mime_type)
-    file_part = SimpleNamespace(kind="file", file=file_obj)
-    ctx.message.parts.append(file_part)
-    return ctx
-
-
-@pytest.mark.asyncio
-async def test_session_id_prefers_context_id_over_task_id(monkeypatch):
-    """RFC #600: context_id is the stable cross-turn key — execute() must
-    pass it to the openclaw CLI so the native SessionManager resumes the
-    same session file across turns."""
+def _patch_cli(monkeypatch):
+    """Patch the CLI spawn + heartbeat; return the captured-args list."""
     captured = []
-
-    class _FakeProc:
-        returncode = 0
-
-        async def communicate(self):
-            return (
-                b'{"result": {"payloads": [{"text": "ok"}]}}',
-                b"",
-            )
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         captured.append(args)
         return _FakeProc()
 
-    monkeypatch.setattr(
-        adapter.asyncio,
-        "create_subprocess_exec",
-        fake_create_subprocess_exec,
-    )
-    monkeypatch.setattr(
-        adapter, "set_current_task", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(adapter.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(adapter, "set_current_task", AsyncMock(return_value=None))
+    # Neutralize the turn-lease side effects in the unit context.
+    monkeypatch.setattr(adapter, "_lease_reset", lambda: None, raising=False)
+    return captured
 
-    ex = adapter.OpenClawA2AExecutor(heartbeat=None)
-    ctx = _build_context(task_id="task-changes-per-turn", context_id="chat-stable")
+
+async def _run(ex, ctx):
     queue = MagicMock()
     queue.enqueue_event = AsyncMock()
-
     await ex.execute(ctx, queue)
 
-    # The CLI args were captured — find --session-id and assert it's
-    # context_id, not task_id.
-    assert len(captured) == 1
-    args = captured[0]
-    sid_idx = args.index("--session-id")
-    assert args[sid_idx + 1] == "chat-stable"
-    assert args[sid_idx + 1] != "task-changes-per-turn"
+
+def _session_arg(args):
+    return args[args.index("--session-id") + 1]
+
+
+def _message_arg(args):
+    return args[args.index("--message") + 1]
 
 
 @pytest.mark.asyncio
-async def test_session_id_falls_back_to_task_id_when_context_id_unset(monkeypatch):
-    """Backwards-compat: legacy clients that don't set context_id still
-    get a deterministic session id (task_id) rather than crashing or
-    silently sharing 'default' across unrelated chats."""
-    captured = []
+async def test_session_id_is_workspace_keyed_and_stable(monkeypatch):
+    """The session id is workspace-keyed and STABLE across fresh context_ids."""
+    captured = _patch_cli(monkeypatch)
+    ex = adapter.OpenClawA2AExecutor(workspace_id="ws-stable-1", heartbeat=None)
 
-    class _FakeProc:
-        returncode = 0
+    await _run(ex, _build_context(task_id="task-a", context_id="ctx-aaaa"))
+    await _run(ex, _build_context(task_id="task-b", context_id="ctx-bbbb"))
 
-        async def communicate(self):
-            return (
-                b'{"result": {"payloads": [{"text": "ok"}]}}',
-                b"",
-            )
-
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        captured.append(args)
-        return _FakeProc()
-
-    monkeypatch.setattr(
-        adapter.asyncio,
-        "create_subprocess_exec",
-        fake_create_subprocess_exec,
-    )
-    monkeypatch.setattr(
-        adapter, "set_current_task", AsyncMock(return_value=None)
-    )
-
-    ex = adapter.OpenClawA2AExecutor(heartbeat=None)
-    ctx = _build_context(task_id="task-only", context_id=None)
-    queue = MagicMock()
-    queue.enqueue_event = AsyncMock()
-
-    await ex.execute(ctx, queue)
-
-    args = captured[0]
-    sid_idx = args.index("--session-id")
-    assert args[sid_idx + 1] == "task-only"
+    assert _session_arg(captured[0]) == "workspace:ws-stable-1"
+    assert _session_arg(captured[1]) == "workspace:ws-stable-1"  # stable, not ctx-bbbb
 
 
 @pytest.mark.asyncio
-async def test_session_id_falls_back_to_default_when_both_unset(monkeypatch):
-    """Final fallback when neither context_id nor task_id is provided —
-    matches legacy behavior so totally-anonymous inbound messages still
-    invoke openclaw successfully (single shared session, not a crash)."""
-    captured = []
-
-    class _FakeProc:
-        returncode = 0
-
-        async def communicate(self):
-            return (
-                b'{"result": {"payloads": [{"text": "ok"}]}}',
-                b"",
-            )
-
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        captured.append(args)
-        return _FakeProc()
-
-    monkeypatch.setattr(
-        adapter.asyncio,
-        "create_subprocess_exec",
-        fake_create_subprocess_exec,
-    )
-    monkeypatch.setattr(
-        adapter, "set_current_task", AsyncMock(return_value=None)
-    )
-
-    ex = adapter.OpenClawA2AExecutor(heartbeat=None)
-    ctx = _build_context(task_id=None, context_id=None)
-    queue = MagicMock()
-    queue.enqueue_event = AsyncMock()
-
-    await ex.execute(ctx, queue)
-
-    args = captured[0]
-    sid_idx = args.index("--session-id")
-    assert args[sid_idx + 1] == "default"
+async def test_session_id_falls_back_to_context_id_without_workspace(monkeypatch):
+    captured = _patch_cli(monkeypatch)
+    ex = adapter.OpenClawA2AExecutor(workspace_id="", heartbeat=None)
+    ex._workspace_id = ""  # force the no-identity fallback path deterministically
+    await _run(ex, _build_context(task_id="task-changes", context_id="chat-stable"))
+    assert _session_arg(captured[0]) == "chat-stable"
 
 
 @pytest.mark.asyncio
-async def test_image_attachment_adds_media_token(monkeypatch, tmp_path):
-    """Image file parts are surfaced to OpenClaw's media parser via MEDIA tokens."""
-    import molecule_runtime.executor_helpers as _helpers
-    monkeypatch.setattr(_helpers, "WORKSPACE_MOUNT", str(tmp_path))
-    captured = []
+async def test_session_id_falls_back_to_task_id_then_default(monkeypatch):
+    captured = _patch_cli(monkeypatch)
+    ex = adapter.OpenClawA2AExecutor(workspace_id="", heartbeat=None)
+    ex._workspace_id = ""
+    await _run(ex, _build_context(task_id="task-only", context_id=None))
+    assert _session_arg(captured[0]) == "task-only"
 
-    class _FakeProc:
-        returncode = 0
+    captured.clear()
+    ex2 = adapter.OpenClawA2AExecutor(workspace_id="", heartbeat=None)
+    ex2._workspace_id = ""
+    await _run(ex2, _build_context(task_id=None, context_id=None))
+    assert _session_arg(captured[0]) == "default"
 
-        async def communicate(self):
-            return (
-                b'{"result": {"payloads": [{"text": "ok"}]}}',
-                b"",
-            )
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        captured.append(args)
-        return _FakeProc()
+@pytest.mark.asyncio
+async def test_history_is_injected_into_message(monkeypatch):
+    """metadata.history is prepended to the CLI --message (a 2nd turn keeps context)."""
+    captured = _patch_cli(monkeypatch)
+    ex = adapter.OpenClawA2AExecutor(workspace_id="ws-1", heartbeat=None)
+    history = [
+        {"role": "user", "parts": [{"text": "my name is Ada"}]},
+        {"role": "agent", "parts": [{"text": "Hello Ada"}]},
+    ]
+    await _run(ex, _build_context(task_id="t", context_id="c", history=history))
+
+    message = _message_arg(captured[0])
+    assert "my name is Ada" in message
+    assert "Hello Ada" in message
+    assert "Conversation so far:" in message  # build_task_text framing
+
+
+def test_decorate_message_adds_media_lines_for_images():
+    """Unit: _decorate_message surfaces image attachments as MEDIA: lines."""
+    ex = adapter.OpenClawA2AExecutor(workspace_id="ws-1", heartbeat=None)
+    out = ex._decorate_message(
+        "look at this",
+        [
+            {"name": "shape-probe.png", "mime_type": "image/png", "path": "/w/shape-probe.png"},
+            {"name": "doc.txt", "mime_type": "text/plain", "path": "/w/doc.txt"},
+        ],
+    )
+    assert "look at this" in out
+    assert "MEDIA: /w/shape-probe.png" in out
+    assert "doc.txt" not in out  # only images get a MEDIA line
+
+
+@pytest.mark.asyncio
+async def test_image_attachment_flows_into_cli_message(monkeypatch):
+    """End-to-end: an image attachment reaches the CLI --message as a MEDIA line.
+
+    The file-URI resolver (executor_helpers.extract_attached_files) needs platform
+    env to resolve URIs; that is orthogonal to this adapter, so we patch it in the
+    base to return an already-resolved image dict and assert the MEDIA line reaches
+    the CLI through the base execute() -> _decorate_message -> build_task_text flow.
+    """
+    import molecule_runtime.subprocess_executor as _base
+
+    async def _noop_vision(text, files):
+        return text
 
     monkeypatch.setattr(
-        adapter.asyncio,
-        "create_subprocess_exec",
-        fake_create_subprocess_exec,
+        _base,
+        "extract_attached_files",
+        lambda _message: [
+            {"name": "shape-probe.png", "mime_type": "image/png", "path": "/w/shape-probe.png"}
+        ],
     )
-    monkeypatch.setattr(
-        adapter, "set_current_task", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(_base, "append_image_descriptions", _noop_vision)
+    captured = _patch_cli(monkeypatch)
 
-    png = tmp_path / "shape-probe.png"
-    png.write_bytes(b"png")
-    ex = adapter.OpenClawA2AExecutor(heartbeat=None)
-    ctx = _build_context_with_file(
-        task_id="task-1",
-        context_id="chat-1",
-        name="shape-probe.png",
-        mime_type="image/png",
-        path=str(png),
-    )
-    queue = MagicMock()
-    queue.enqueue_event = AsyncMock()
+    ex = adapter.OpenClawA2AExecutor(workspace_id="ws-1", heartbeat=None)
+    await _run(ex, _build_context(task_id="task-1", context_id="chat-1"))
 
-    await ex.execute(ctx, queue)
-
-    args = captured[0]
-    message = args[args.index("--message") + 1]
+    message = _message_arg(captured[0])
     assert "shape-probe.png" in message
-    assert f"MEDIA: {png}" in message
+    assert "MEDIA: /w/shape-probe.png" in message
