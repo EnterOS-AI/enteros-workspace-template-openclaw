@@ -17,20 +17,25 @@ import shutil
 import subprocess
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
-from molecule_runtime.adapters.shared_runtime import brief_task, extract_message_text, set_current_task
-from molecule_runtime.executor_helpers import extract_attached_files
-try:
-    from molecule_runtime.attachment_vision import append_image_descriptions
-except ModuleNotFoundError:  # pragma: no cover - older local runtime
-    async def append_image_descriptions(text, files):
-        return text
 from a2a.server.agent_execution import AgentExecutor
 
-# Shared subprocess-executor base (tenant-agent BUG 3): the session+history
-# CONTRACT — history injection (build_task_text + extract_history) + a STABLE
-# WORKSPACE_ID-keyed session id — lives ONCE in the SSOT runtime SDK so every
-# subprocess runtime inherits it. OpenClawA2AExecutor below is a thin subclass
-# that provides ONLY the openclaw shell-out (run_agent) + MEDIA adornment.
+# NOTE: the message-extraction / task-brief / attachment / vision helpers
+# (extract_message_text, brief_task, set_current_task, extract_attached_files,
+# append_image_descriptions) are DELIBERATELY not imported here anymore. They
+# were only used by this template's old hand-rolled ``execute()`` override, which
+# has been removed — the shared ``SubprocessA2AExecutor`` base now owns the whole
+# ``execute()`` body (message extraction, image enrichment, session-id, heartbeat)
+# so this adapter stays a THIN subclass and does not duplicate the base's imports.
+
+# Shared subprocess-executor base (tenant-agent BUG 3): the session CONTRACT —
+# a STABLE WORKSPACE_ID-keyed session id so the runtime's native session RESUMES
+# across turns — lives ONCE in the SSOT runtime SDK so every subprocess runtime
+# inherits it. Continuity is that native session, NOT a force-injected transcript:
+# the base passes ONLY the current user message to run_agent (no metadata.history
+# is prepended; older history is retrieved only if the agent chooses to call a
+# platform-workspace MCP tool). OpenClawA2AExecutor below is a thin subclass that
+# provides ONLY the openclaw shell-out (run_agent) + MEDIA adornment; it does NOT
+# override execute() and does NOT inject history.
 from molecule_runtime.subprocess_executor import SubprocessA2AExecutor
 
 # Turn-lease liveness (MUST-FIX 1) is provided by the mailbox-kernel runtime.
@@ -1280,11 +1285,14 @@ async def _communicate_touching_lease(proc, *, timeout):
 class OpenClawA2AExecutor(SubprocessA2AExecutor):
     """Shells A2A turns out to the ``openclaw agent`` CLI subprocess.
 
-    tenant-agent BUG 3: the session+history CONTRACT is INHERITED from
-    ``SubprocessA2AExecutor`` — conversation history is injected into the task
-    text (``build_task_text``) and the openclaw ``--session-id`` is derived from
-    the STABLE workspace identity (not the per-request ``context_id`` the a2a-sdk
-    mints fresh each turn). This class provides ONLY:
+    tenant-agent BUG 3: the SESSION contract is INHERITED from
+    ``SubprocessA2AExecutor`` — the openclaw ``--session-id`` is derived from the
+    STABLE workspace identity (not the per-request ``context_id`` the a2a-sdk mints
+    fresh each turn), so openclaw's native session RESUMES across turns. Continuity
+    is that native session; conversation history is NOT force-injected into the
+    task text — the base passes ONLY the current user message to ``run_agent``, and
+    older history is retrieved only if the agent chooses to call a platform-workspace
+    MCP tool. This class provides ONLY:
 
       * ``_decorate_message`` — the openclaw ``MEDIA:`` image lines, and
       * ``run_agent``         — the ``openclaw agent`` shell-out (+ turn-lease
@@ -1298,8 +1306,9 @@ class OpenClawA2AExecutor(SubprocessA2AExecutor):
 
     def _decorate_message(self, user_message, attached):
         # Surface image attachments to OpenClaw's media parser via MEDIA: lines.
-        # Runs before history is prepended by the base, so both the current
-        # media refs and the prior-turn transcript reach the CLI.
+        # Adorns the CURRENT user message only; the base does not prepend any
+        # prior-turn transcript, so what reaches the CLI is this turn's message
+        # plus its media refs (continuity is openclaw's own resumed session).
         image_media_lines = [
             f"MEDIA: {f['path']}"
             for f in attached
@@ -1321,9 +1330,10 @@ class OpenClawA2AExecutor(SubprocessA2AExecutor):
         # by _communicate_touching_lease below.
         _lease_reset()
 
-        # task_text already carries the injected conversation history
-        # (base: build_task_text) and any MEDIA: lines (_decorate_message);
-        # session_id is the STABLE workspace-keyed key (base: derive_session_id).
+        # task_text is the CURRENT user message only (+ any MEDIA: lines from
+        # _decorate_message) — the base does NOT inject conversation history;
+        # continuity comes from openclaw resuming the native session keyed on
+        # session_id, the STABLE workspace-keyed id (base: derive_session_id).
         #
         # Call OpenClaw agent via CLI, retrying once if we hit the
         # scope-upgrade-pending gate. The priming step in setup() should
