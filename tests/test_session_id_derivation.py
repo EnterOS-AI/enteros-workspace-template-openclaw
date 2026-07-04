@@ -131,8 +131,30 @@ async def test_session_id_is_workspace_keyed_and_stable(monkeypatch):
     await _run(ex, _build_context(task_id="task-a", context_id="ctx-aaaa"))
     await _run(ex, _build_context(task_id="task-b", context_id="ctx-bbbb"))
 
-    assert _session_arg(captured[0]) == "workspace:ws-stable-1"
-    assert _session_arg(captured[1]) == "workspace:ws-stable-1"  # stable, not ctx-bbbb
+    # The base derives the STABLE "workspace:<id>" session key, but run_agent
+    # sanitizes ':' -> '-' for the openclaw CLI (the gateway rejects a colon in
+    # --session-id with "Invalid session ID"). The mapping is DETERMINISTIC, so
+    # the native session still RESUMES across turns — the CLI arg is the dash form.
+    assert _session_arg(captured[0]) == "workspace-ws-stable-1"
+    assert _session_arg(captured[1]) == "workspace-ws-stable-1"  # stable, not ctx-bbbb
+
+
+@pytest.mark.asyncio
+async def test_session_id_colon_is_sanitized_to_dash_for_gateway(monkeypatch):
+    """The workspace-keyed session id reaches the openclaw CLI with ':' -> '-'.
+
+    OpenClaw's gateway rejects a --session-id containing ':' with "Invalid session
+    ID" (GatewayClientRequestError), which failed EVERY A2A turn on an openclaw
+    concierge (verified live). run_agent maps ':' -> '-' for the CLI only; the map
+    is deterministic so the native session still resumes. This pins that the colon
+    NEVER reaches the CLI arg.
+    """
+    captured = _patch_cli(monkeypatch)
+    ex = adapter.OpenClawA2AExecutor(workspace_id="ws-colon-1", heartbeat=None)
+    await _run(ex, _build_context(task_id="t", context_id="c"))
+    session_arg = _session_arg(captured[0])
+    assert ":" not in session_arg  # the gateway would 400 on a colon
+    assert session_arg == "workspace-ws-colon-1"
 
 
 @pytest.mark.asyncio
@@ -187,8 +209,9 @@ async def test_history_is_NOT_injected_into_message(monkeypatch):
     assert "my name is Ada" not in message
     assert "Hello Ada" not in message
     assert "Conversation so far:" not in message  # old build_task_text framing is gone
-    # Continuity instead rides on the STABLE workspace-keyed session id.
-    assert _session_arg(captured[0]) == "workspace:ws-1"
+    # Continuity instead rides on the STABLE workspace-keyed session id — passed to
+    # the openclaw CLI in its gateway-accepted, ':'->'-' sanitized dash form.
+    assert _session_arg(captured[0]) == "workspace-ws-1"
 
 
 @pytest.mark.asyncio
@@ -202,8 +225,9 @@ async def test_history_not_injected_even_across_turns(monkeypatch):
 
     assert _message_arg(captured[0]) == "first"
     assert _message_arg(captured[1]) == "second"  # not "first\n...second"
-    # Same resumed native session both turns (continuity source).
-    assert _session_arg(captured[0]) == _session_arg(captured[1]) == "workspace:ws-1"
+    # Same resumed native session both turns (continuity source) — the CLI receives
+    # the ':'->'-' sanitized dash form the gateway accepts.
+    assert _session_arg(captured[0]) == _session_arg(captured[1]) == "workspace-ws-1"
 
 
 def test_decorate_message_adds_media_lines_for_images():
