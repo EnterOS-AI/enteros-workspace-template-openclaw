@@ -77,7 +77,33 @@ OPENCLAW_PROVIDERS = {
     "moonshot":   (("KIMI_API_KEY",),                       "https://api.moonshot.ai/v1"),
 }
 
-OPENCLAW_WORKSPACE = os.path.expanduser("~/.openclaw/workspace-dev/main")
+def _openclaw_workspace_dir() -> str:
+    """Resolve the workspace dir OpenClaw's gateway ACTUALLY reads SOUL.md from.
+
+    Mirrors openclaw's own ``resolveDefaultAgentWorkspaceDir`` (verified against
+    openclaw 2026.6.11, dist/config-utils): the default agent's workspace is
+    ``~/.openclaw/workspace``, partitioned to ``~/.openclaw/workspace-<profile>``
+    ONLY when ``OPENCLAW_PROFILE`` is set to a non-``default`` value. It is NOT
+    suffixed with the agent id for the default agent.
+
+    The prior literal ``~/.openclaw/workspace-dev/main`` was wrong on BOTH axes:
+    it assumed the gateway's ``--dev`` flag implies ``OPENCLAW_PROFILE=dev`` (it
+    does not — ``--dev`` is a gateway launch mode, orthogonal to the workspace
+    profile) AND it appended a ``/main`` agent-id segment the resolver never adds
+    for the default agent. The materialized SOUL.md therefore landed in a dir the
+    gateway never read, so a fresh openclaw concierge ran the STOCK OpenClaw
+    SOUL.md and self-identified generically. Resolved per-call (like
+    ``_openclaw_config_path``) so it tracks $HOME / OPENCLAW_PROFILE at use time.
+    """
+    profile = (os.environ.get("OPENCLAW_PROFILE") or "").strip().lower()
+    if profile and profile != "default":
+        return os.path.expanduser(f"~/.openclaw/workspace-{profile}")
+    return os.path.expanduser("~/.openclaw/workspace")
+
+
+# The workspace dir OpenClaw reads (SOUL.md et al.). Resolved at import from the
+# same rule the gateway uses; see _openclaw_workspace_dir for the fix rationale.
+OPENCLAW_WORKSPACE = _openclaw_workspace_dir()
 OPENCLAW_PORT = 18789
 # Port for the molecule A2A MCP server (HTTP transport). HTTP is used
 # instead of stdio because a2a_mcp_server's stdio main() blocks on a
@@ -716,6 +742,16 @@ class OpenClawAdapter(BaseAdapter):
         # management-MCP-less concierge fails CLOSED + loudly rather than silent.
         await self._install_declared_mcp_plugins(config)
 
+        # 4d. Materialize the ASSEMBLED platform system prompt into the SOUL.md the
+        #     gateway reads. Runs AFTER 4c on purpose: the orchestrator-only
+        #     guardrail is gated on the management MCP being wired
+        #     (mcp_server_present), which 4c is what installs — so a concierge
+        #     reports True here and gets gagged from self-executing, while a worker
+        #     reports False and keeps doing real work. This is what turns a fresh
+        #     openclaw concierge from generic ("I don't have an identity yet") into
+        #     the Org Concierge orchestrator (persona + peers + coordinator + guardrail).
+        await self._materialize_persona_into_soul(config)
+
         # 5. Start the gateway as a background process
         gateway_port = config.runtime_config.get("gateway_port", OPENCLAW_PORT)
         logger.info(f"Starting OpenClaw gateway on port {gateway_port}...")
@@ -1109,6 +1145,108 @@ class OpenClawAdapter(BaseAdapter):
                 f"{result.stderr.strip() or result.stdout.strip()}"
             )
         logger.info("Registered molecule MCP server with OpenClaw")
+
+    async def _materialize_persona_into_soul(self, config: AdapterConfig) -> None:
+        """Assemble the FULL platform system prompt and write it into the SOUL.md
+        the openclaw gateway reads, so a fresh concierge boots AS its delivered
+        persona rather than the stock OpenClaw SOUL.md.
+
+        The step-4 raw ``/configs/*.md`` copy was insufficient on three counts,
+        all fixed here:
+
+          * it NEVER called ``build_system_prompt`` — so the orchestrator-only
+            guardrail ("you NEVER do the work yourself"), the resolved platform
+            instructions, the peer roster, and the coordinator/children context
+            were absent from the model's on-disk identity;
+          * it wrote to the wrong dir (fixed by ``_openclaw_workspace_dir``); and
+          * the concierge persona is delivered at ``/configs/prompts/concierge.md``
+            — a SUBDIR the top-level ``*.md`` copy skips — which
+            ``build_system_prompt`` loads via ``config.prompt_files``.
+
+        This is the openclaw arm of the base runtime's persona-materialization
+        contract (``_common_setup`` -> ``build_system_prompt`` -> native identity
+        file: claude-code=system-prompt.md, openclaw=SOUL.md). We assemble here
+        rather than calling ``_common_setup`` wholesale so we do NOT re-run the
+        openclaw MCP install pipeline (owned by ``_install_declared_mcp_plugins``).
+
+        Best-effort by design (mirrors the runtime port): any failure logs loudly
+        but never bricks boot — the raw copied SOUL.md remains as a fallback.
+        """
+        try:
+            from molecule_runtime.prompt import (
+                build_system_prompt,
+                get_peer_capabilities,
+                get_platform_instructions,
+            )
+            from molecule_runtime.skill_loader.loader import load_skills
+        except Exception as e:  # noqa: BLE001 — older runtime wheel: leave raw SOUL.md
+            logger.warning(
+                "openclaw persona: runtime prompt builder unavailable (%s); "
+                "leaving raw SOUL.md in place", e,
+            )
+            return
+
+        platform_url = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
+
+        # Skills declared for this workspace (runtime-filtered). Fail-open to none.
+        try:
+            loaded_skills = load_skills(
+                config.config_path, getattr(config, "tools", []) or [],
+                current_runtime=self.name(),
+            )
+        except Exception:  # noqa: BLE001
+            loaded_skills = []
+
+        # Peer roster + resolved platform instructions (both fail-open to empty
+        # inside the runtime helpers, so a platform blip never bricks boot).
+        peers = await get_peer_capabilities(platform_url, config.workspace_id)
+        platform_instructions = await get_platform_instructions(platform_url, config.workspace_id)
+
+        # Coordinator/children context (a parent-of-a-team concierge) — same source
+        # the base _common_setup uses. Absent/empty for a leaf workspace.
+        extra_prompts: list[str] = []
+        try:
+            from molecule_runtime.coordinator import get_children, build_children_description
+            children = await get_children()
+            if children:
+                extra_prompts.append(build_children_description(children))
+        except Exception:  # noqa: BLE001 — coordinator context is additive, never required
+            pass
+
+        # Orchestrator-only guardrail gate (platform/concierge ONLY). Ask the
+        # runtime whether the privileged management MCP is wired into openclaw's
+        # native config — True on a concierge (4c installed it), False on a worker.
+        # Default to worker (no guardrail) on any error so a worker is never gagged.
+        try:
+            from molecule_runtime.platform_agent_identity import mcp_server_present
+            is_platform_agent = mcp_server_present()
+        except Exception:  # noqa: BLE001
+            is_platform_agent = False
+
+        assembled = build_system_prompt(
+            config.config_path,
+            config.workspace_id,
+            loaded_skills,
+            peers,
+            prompt_files=getattr(config, "prompt_files", None) or None,
+            plugin_prompts=extra_prompts or None,
+            platform_instructions=platform_instructions,
+            platform_guardrail=is_platform_agent,
+        )
+
+        # SSOT: publish the single assembled prompt back onto the shared config so
+        # any later reader agrees with what the gateway loads.
+        config.system_prompt = assembled
+
+        os.makedirs(OPENCLAW_WORKSPACE, exist_ok=True)
+        soul_path = os.path.join(OPENCLAW_WORKSPACE, "SOUL.md")
+        with open(soul_path, "w") as fh:
+            fh.write(assembled if assembled.endswith("\n") else assembled + "\n")
+        logger.info(
+            "openclaw persona: wrote assembled system prompt to %s "
+            "(%d chars, guardrail=%s, %d peer(s), %d skill(s))",
+            soul_path, len(assembled), is_platform_agent, len(peers), len(loaded_skills),
+        )
 
     async def _install_declared_mcp_plugins(self, config: AdapterConfig):
         """Drive the base per-runtime plugin pipeline for declared plugins (P4).
