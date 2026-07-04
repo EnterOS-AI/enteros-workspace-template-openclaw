@@ -248,6 +248,15 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: pip install -q pytest pytest-asyncio pyyaml python-multipart && pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
+      # Concierge MCP loaded+callable e2e (fail-before/pass-after) — the
+      # strengthened guard for the mcpServers:NONE / declared-but-dead class of
+      # regression the mocked test_openclaw_mgmt_mcp.py could not catch. The
+      # LOGIC layer stands up a REAL stdio MCP server and asserts the required
+      # privileged tool set (provision_workspace, commit_memory, ...) is actually
+      # advertised over the wire. The LIVE layer (docker exec into a real
+      # concierge) auto-skips here and is driven by the deploy gate via
+      # MOLECULE_LIVE_CONCIERGE_CONTAINER.
+      - run: python3 -m pytest tests/test_openclaw_concierge_mcp_live_e2e.py -v
       - run: python3 -m pytest tests/ -v
 
   validate:
