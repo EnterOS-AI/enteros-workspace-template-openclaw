@@ -1342,11 +1342,20 @@ class OpenClawA2AExecutor(SubprocessA2AExecutor):
         # retry-with-approve here makes the turn self-healing so a single
         # canvas message can recover from a stale pairing without a restart.
         reply = None
+        # OpenClaw's gateway rejects a --session-id containing ':' with
+        # "Invalid session ID" (GatewayClientRequestError), which fails EVERY
+        # A2A turn on an openclaw concierge. The shared derive_session_id emits
+        # the stable "workspace:<uuid>" form (fine for claude-code/codex/hermes
+        # native sessions). Map ':' -> '-' for the OpenClaw CLI only: the mapping
+        # is DETERMINISTIC so the native session still RESUMES across turns, and
+        # "workspace-<uuid>" is accepted by the gateway (verified on a live
+        # baked concierge: colon form -> Invalid session ID; dash form -> ok).
+        oc_session_id = session_id.replace(":", "-")
         try:
             for attempt in range(2):
                 proc = await asyncio.create_subprocess_exec(
                     "openclaw", "agent",
-                    "--session-id", session_id,
+                    "--session-id", oc_session_id,
                     "--message", task_text,
                     "--json", "--timeout", "120",
                     stdout=asyncio.subprocess.PIPE,
