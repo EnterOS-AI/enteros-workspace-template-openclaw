@@ -1,0 +1,41 @@
+{
+  "_provenance": "AUTO-GENERATED - DO NOT EDIT. Regenerated from the synced internal/providers/providers.yaml by `python internal/providers/registry_projection.py generate <runtime>`. Hand-authored config.yaml stays authoritative; this is the registry's informational projection of this runtime.",
+  "in_registry": true,
+  "providers": [
+    {
+      "models": [],
+      "name": "byok-minimax"
+    },
+    {
+      "models": [],
+      "name": "byok-openai"
+    },
+    {
+      "models": [],
+      "name": "custom"
+    },
+    {
+      "models": [],
+      "name": "groq"
+    },
+    {
+      "models": [
+        "moonshot:kimi-k2.5",
+        "moonshot:kimi-k2.6"
+      ],
+      "name": "kimi-coding"
+    },
+    {
+      "models": [],
+      "name": "openrouter"
+    },
+    {
+      "models": [
+        "moonshot/kimi-k2.5",
+        "moonshot/kimi-k2.6"
+      ],
+      "name": "platform"
+    }
+  ],
+  "runtime": "openclaw"
+}

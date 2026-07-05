@@ -2,8 +2,76 @@ name: OpenClaw Agent
 description: OpenClaw framework — multi-file prompt system with SOUL, BOOTSTRAP, AGENTS, TOOLS, and HEARTBEAT modules
 version: 1.0.0
 tier: 2
+
+# Provider registry — declarative SSOT mirroring adapter.py's
+# OPENCLAW_PROVIDERS dict (the runtime authority used by
+# resolve_provider_routing). Encoding the same taxonomy in YAML lets
+# workspace-server (cp#220 hard-gate) and the canvas Config tab
+# validate / surface providers without parsing Python.
+#
+# Adding a new provider here = also add it to OPENCLAW_PROVIDERS in
+# adapter.py (model_prefix → (auth_env_vars, base_url)), and (if
+# cp#220 v1 still applies) extend KnownProviderNames() in
+# molecule-controlplane userdata_containerized.go. Track that under
+# SSOT audit comment 40629 finding #4.
+#
+# Model-id format is `<provider>:<vendor-model-id>` (colon-separated,
+# NOT slash-separated like hermes — matches adapter.py's `prefix, _,
+# _ = model_str.partition(":")` split). See coerce_servable_model for
+# the resolution path.
+#
+# Schema per entry:
+#   name           : provider prefix (the substring before `:` in a
+#                    model id, e.g. `minimax` for `minimax:MiniMax-M2.7`).
+#                    1:1 with OPENCLAW_PROVIDERS keys.
+#   base_url       : default OpenAI-compat endpoint OpenClaw points the
+#                    custom-provider profile at. Tracked for parity
+#                    with adapter.py — the runtime may rewrite this
+#                    on the fly when an sk-cp-* token is detected
+#                    (see resolve_provider_routing's minimax/moonshot
+#                    branches that re-aim at api.minimax.io/anthropic
+#                    and api.kimi.com/coding respectively).
+#   auth_env       : env vars accepted; ANY ONE being set satisfies
+#                    auth (OR-semantics).
+providers:
+  - name: openai
+    base_url: https://api.openai.com/v1
+    auth_env: [OPENAI_API_KEY]
+
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    auth_env: [GROQ_API_KEY]
+
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    auth_env: [OPENROUTER_API_KEY]
+
+  - name: qianfan
+    base_url: https://qianfan.baidubce.com/v2
+    auth_env: [QIANFAN_API_KEY, AISTUDIO_API_KEY]
+
+  - name: minimax
+    # Native registry URL. adapter.py's resolve_provider_routing
+    # rewrites to https://api.minimax.io/anthropic when the supplied
+    # key starts with sk-cp- (token-plan via Anthropic-compat shim),
+    # so this base_url is the keyed-vendor default, not a hard pin.
+    base_url: https://api.minimaxi.com/v1
+    auth_env: [MINIMAX_API_KEY]
+
+  - name: moonshot
+    # adapter.py rewrites to https://api.kimi.com/coding when an
+    # sk-kimi-* key is detected — see resolve_provider_routing.
+    base_url: https://api.moonshot.ai/v1
+    auth_env: [KIMI_API_KEY]
+
 runtime: openclaw
-model: openai:gpt-4.1-mini
+# Default model — must mirror adapter.py OPENCLAW_DEFAULT_MODEL. minimax
+# is in OPENCLAW_PROVIDERS AND MINIMAX_API_KEY is the credential a fresh
+# openclaw workspace actually receives (an sk-cp-* token via the seeded
+# custom-api-minimaxi-com provider); openai:* was routable but keyless
+# on fresh provisions, which bricked setup() before the platform MCP
+# was registered.
+model: minimax:MiniMax-M2.7
 prompt_files:
 - SOUL.md
 - BOOTSTRAP.md
@@ -15,20 +83,67 @@ a2a:
   port: 8000
   streaming: true
   push_notifications: true
-env:
-  required:
-  - OPENAI_API_KEY
 template_schema_version: 1
-models:
-- id: openai:gpt-4.1-mini
-  name: GPT-4.1 Mini (OpenAI)
-  required_env:
-  - OPENAI_API_KEY
-- id: openai:gpt-4o
-  name: GPT-4o (OpenAI)
-  required_env:
-  - OPENAI_API_KEY
-- id: openai:o4-mini
-  name: o4-Mini (OpenAI)
-  required_env:
-  - OPENAI_API_KEY
+runtime_config:
+  model: minimax:MiniMax-M2.7
+  # First entry is the effective default — must match `model:` above and
+  # adapter.py OPENCLAW_DEFAULT_MODEL, and its required_env must be a key
+  # a fresh openclaw workspace genuinely has (MINIMAX_API_KEY).
+  models:
+  - id: minimax:MiniMax-M2.7
+    name: MiniMax M2.7 (MiniMax)
+    required_env:
+    - MINIMAX_API_KEY
+  - id: minimax:MiniMax-M2.7-highspeed
+    name: MiniMax M2.7 Highspeed (MiniMax)
+    required_env:
+    - MINIMAX_API_KEY
+  - id: openai:gpt-4.1-mini
+    name: GPT-4.1 Mini (OpenAI)
+    required_env:
+    - OPENAI_API_KEY
+  - id: openai:gpt-4o
+    name: GPT-4o (OpenAI)
+    required_env:
+    - OPENAI_API_KEY
+  - id: openai:o4-mini
+    name: o4-Mini (OpenAI)
+    required_env:
+    - OPENAI_API_KEY
+  - id: groq:llama-3.3-70b-versatile
+    name: Llama 3.3 70B (Groq)
+    required_env:
+    - GROQ_API_KEY
+  - id: groq:meta-llama/llama-4-scout-17b-16e-instruct
+    name: Llama 4 Scout (Groq)
+    required_env:
+    - GROQ_API_KEY
+  - id: openrouter:openai/gpt-4.1-mini
+    name: GPT-4.1 Mini (OpenRouter)
+    required_env:
+    - OPENROUTER_API_KEY
+  - id: openrouter:anthropic/claude-sonnet-4-5
+    name: Claude Sonnet 4.5 (OpenRouter)
+    required_env:
+    - OPENROUTER_API_KEY
+  - id: moonshot:kimi-k2.6
+    name: Kimi K2.6 (Moonshot)
+    required_env:
+    - KIMI_API_KEY
+  - id: moonshot:kimi-k2.5
+    name: Kimi K2.5 (Moonshot)
+    required_env:
+    - KIMI_API_KEY
+  # Molecule platform-managed (no tenant key — platform owns billing). Slash
+  # form (vs the colon BYOK ids above): adapter.py resolve_platform_routing
+  # sends these to the proxy OpenAI-compat surface, which resolves moonshot/*
+  # -> Kimi. Must match the controlplane providers manifest's openclaw platform
+  # set (drift-gated by molecule-ci validate-workspace-template).
+  - id: moonshot/kimi-k2.6
+    name: Kimi K2.6 (Molecule platform)
+    provider: platform
+    required_env: []
+  - id: moonshot/kimi-k2.5
+    name: Kimi K2.5 (Molecule platform)
+    provider: platform
+    required_env: []
