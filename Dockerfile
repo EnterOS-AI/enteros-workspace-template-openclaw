@@ -93,9 +93,17 @@ RUN set -eux; \
 #
 # MCP_SERVER_VERSION MUST match the plugin fragment's pinned version
 # (molecule-ai-plugin-molecule-platform-mcp settings-fragment.json). A stale bake
-# still WORKS (npx --prefer-offline network-fallback) but forfeits determinism, so
-# keep them in lockstep. Declared as an ARG so the publish workflow can override.
-ARG MCP_SERVER_VERSION=1.7.0
+# does NOT merely forfeit determinism: when the plugin pins AHEAD of this baked
+# version the runtime's `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
+# MISSES the <BAKED>-only cache and COLD-PULLS <PIN>, which under CF-WAF
+# throttling hard-fails ETARGET -> the concierge FALSE-READYs on every bump
+# (#228). GUARD D (task #229) enforces this lockstep as a HARD CI gate
+# (scripts/lint-mcp-pin-lockstep.sh, wired into ci.yml) and the publish workflow
+# OVERRIDES this default with the SSOT-derived --build-arg MCP_SERVER_VERSION so
+# the pushed image is ALWAYS built with the plugin-pinned version. This default
+# is kept in lockstep for plain/local `docker build` (no --build-arg) and is
+# machine-checked against the plugin SSOT on every PR.
+ARG MCP_SERVER_VERSION=1.8.1
 USER agent
 RUN set -eux; \
     mkdir -p /home/agent/.npm; \
