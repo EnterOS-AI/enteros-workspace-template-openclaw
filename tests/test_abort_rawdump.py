@@ -9,44 +9,15 @@ payload-less branch, which dumped the ENTIRE run-result object
 These tests pin ``_clean_reply_from_envelope`` — the pure helper the fix routes
 the payload-less branch through — to prove it surfaces ONLY clean text and never
 the raw envelope.
+
+Import note: like every other test in this repo, ``adapter`` is loaded by
+``conftest.py`` (repo-root on sys.path, adapter.py loaded as a top-level module).
+We intentionally do NOT stub ``molecule_runtime`` here — doing so would replace
+the real ``SubprocessA2AExecutor`` base in ``sys.modules`` for the whole session
+and break sibling tests that construct ``OpenClawA2AExecutor``.
 """
 
-import sys
-import types
-
-
-def _install_runtime_stubs():
-    """Stub the two module-load-time molecule_runtime imports adapter.py needs so
-    the module imports without the full runtime installed. The try/except imports
-    (turn_lease, platform_agent_identity) degrade on their own when absent."""
-    if "molecule_runtime" not in sys.modules:
-        sys.modules["molecule_runtime"] = types.ModuleType("molecule_runtime")
-
-    base = types.ModuleType("molecule_runtime.adapters.base")
-    class BaseAdapter:  # minimal stand-in
-        pass
-    class AdapterConfig:  # minimal stand-in
-        pass
-    base.BaseAdapter = BaseAdapter
-    base.AdapterConfig = AdapterConfig
-    adapters_pkg = types.ModuleType("molecule_runtime.adapters")
-    adapters_pkg.base = base
-    sys.modules["molecule_runtime.adapters"] = adapters_pkg
-    sys.modules["molecule_runtime.adapters.base"] = base
-
-    subproc = types.ModuleType("molecule_runtime.subprocess_executor")
-    class SubprocessA2AExecutor:  # usable as a base class
-        pass
-    subproc.SubprocessA2AExecutor = SubprocessA2AExecutor
-    sys.modules["molecule_runtime.subprocess_executor"] = subproc
-
-
-_install_runtime_stubs()
-
-# conftest may have already tried (and failed) to import adapter; import it now
-# with stubs in place.
-sys.modules.pop("adapter", None)
-import adapter  # noqa: E402
+import adapter
 
 
 # The exact aborted-run envelope shape from the demo incident: status:timeout,
