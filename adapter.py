@@ -400,6 +400,43 @@ def coerce_servable_model(model_str: str) -> str:
     return OPENCLAW_DEFAULT_MODEL
 
 
+# Clean status line shown when an openclaw turn aborts / times out with NO
+# assistant text at all (e.g. aborted mid-tool-use before any visible text was
+# produced). Deliberately generic + reassuring — an orchestration turn that hits
+# the per-turn cap while delegating is still "working", so tell the user that
+# rather than dumping the raw envelope or an "error".
+_OPENCLAW_ABORT_STATUS_TEXT = (
+    "Working on it — delegating to the team; a consolidated update is on the way."
+)
+
+
+def _clean_reply_from_envelope(result: dict, data: dict) -> str:
+    """Derive a USER-SAFE reply from a payload-less openclaw ``agent --json``
+    envelope (aborted / timed-out run), never the raw run-result object.
+
+    OpenClaw's envelope carries the assistant's own text in
+    ``finalAssistantVisibleText`` (and a raw variant in
+    ``finalAssistantRawText``) even when the run aborts at the per-turn cap and
+    emits no ``result.payloads`` entry. We surface that clean text in preference
+    order; only when the engine produced no visible text at all do we fall back
+    to a clean status line. We NEVER return ``str(data)`` — that stringifies the
+    whole run-result (runId/meta/systemPromptReport/tools/executionTrace/…) into
+    the user's chat, which is the demo-critical raw-JSON-dump bug this guards.
+
+    ``finalAssistant*`` normally live under ``result`` (sibling of ``payloads``),
+    but we also check top-level ``data`` defensively in case a future envelope
+    hoists them.
+    """
+    for src in (result, data):
+        if not isinstance(src, dict):
+            continue
+        for key in ("finalAssistantVisibleText", "finalAssistantRawText"):
+            val = src.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return _OPENCLAW_ABORT_STATUS_TEXT
+
+
 class OpenClawAdapter(BaseAdapter):
 
     def __init__(self):
@@ -1511,11 +1548,21 @@ class OpenClawA2AExecutor(SubprocessA2AExecutor):
                 if proc.returncode == 0 and output:
                     try:
                         data = json.loads(output)
-                        payloads = data.get("result", {}).get("payloads", [])
+                        result = data.get("result", {}) if isinstance(data, dict) else {}
+                        payloads = result.get("payloads", []) if isinstance(result, dict) else []
                         if payloads:
                             reply = payloads[0].get("text", "")
                         else:
-                            reply = str(data)
+                            # Payload-less envelope — the run aborted / hit the
+                            # per-turn timeout (status:timeout, aborted:true,
+                            # stopReason:toolUse) BEFORE emitting an assistant
+                            # payload. NEVER stringify the whole run-result object
+                            # into the user's chat: str(data) dumps
+                            # runId/meta/systemPromptReport/tools/executionTrace…
+                            # verbatim (the demo-critical raw-JSON-dump bug).
+                            # Surface only the clean assistant text the engine
+                            # already computed, or a clean status line.
+                            reply = _clean_reply_from_envelope(result, data)
                     except json.JSONDecodeError:
                         reply = output
                     break
