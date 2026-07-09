@@ -103,7 +103,7 @@ RUN set -eux; \
 # the pushed image is ALWAYS built with the plugin-pinned version. This default
 # is kept in lockstep for plain/local `docker build` (no --build-arg) and is
 # machine-checked against the plugin SSOT on every PR.
-ARG MCP_SERVER_VERSION=1.8.1
+ARG MCP_SERVER_VERSION=1.8.2
 USER agent
 RUN set -eux; \
     mkdir -p /home/agent/.npm; \
