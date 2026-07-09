@@ -51,11 +51,15 @@ providers:
     auth_env: [QIANFAN_API_KEY, AISTUDIO_API_KEY]
 
   - name: minimax
-    # Native registry URL. adapter.py's resolve_provider_routing
-    # rewrites to https://api.minimax.io/anthropic when the supplied
-    # key starts with sk-cp- (token-plan via Anthropic-compat shim),
-    # so this base_url is the keyed-vendor default, not a hard pin.
-    base_url: https://api.minimaxi.com/v1
+    # GLOBAL MiniMax host (api.minimax.io/v1) — the OpenAI-compat surface a
+    # global MINIMAX_API_KEY authenticates against. (api.minimaxi.com is the
+    # China endpoint = the distinct `minimax-cn` provider; using it for the
+    # global `minimax` provider 401s and bricks the default model.)
+    # adapter.py's resolve_provider_routing rewrites to
+    # https://api.minimax.io/anthropic when the supplied key starts with sk-cp-
+    # (token-plan via Anthropic-compat shim), so this base_url is the
+    # keyed-vendor default, not a hard pin.
+    base_url: https://api.minimax.io/v1
     auth_env: [MINIMAX_API_KEY]
 
   - name: moonshot
