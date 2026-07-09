@@ -32,7 +32,16 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+  # HERMETIC dep policy (CI-robustness): do NOT set PIP_INDEX_URL=private —
+  # it force-routes EVERY pip install (pytest, pyyaml, jsonschema, …) at the
+  # private index, which serves only molecules-workspace-runtime → 404s all
+  # public tooling (the Adapter-unit-tests / Template-validation reds). Public
+  # tooling resolves from the default (PyPI) index; the private runtime — which
+  # is ABSENT from public PyPI, so no dependency-confusion — is pulled via an
+  # EXPLICIT --extra-index-url on the runtime install only. The legacy name
+  # molecule-ai-workspace-runtime IS squatted on public PyPI (0.1.999999); we
+  # install the CURRENT dist name molecules-workspace-runtime (private-only).
+  MOLECULE_PRIVATE_INDEX: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 permissions:
   contents: read
@@ -113,9 +122,9 @@ jobs:
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       - run: pip install pyyaml -q
       - if: hashFiles('requirements.txt') != ''
-        run: pip install -q -r requirements.txt
+        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
       - if: hashFiles('requirements.txt') == ''
-        run: pip install -q molecule-ai-workspace-runtime
+        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
       - name: Adapter platform-routing unit tests
         # Scoped to the platform-routing test this PR adds. The rest of tests/
@@ -238,13 +247,53 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: pip install -q pytest pytest-asyncio pyyaml molecule-ai-workspace-runtime python-multipart
+      - run: pip install -q pytest pytest-asyncio pyyaml python-multipart && pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
+      # Concierge MCP loaded+callable e2e (fail-before/pass-after) — the
+      # strengthened guard for the mcpServers:NONE / declared-but-dead class of
+      # regression the mocked test_openclaw_mgmt_mcp.py could not catch. The
+      # LOGIC layer stands up a REAL stdio MCP server and asserts the required
+      # privileged tool set (provision_workspace, commit_memory, ...) is actually
+      # advertised over the wire. The LIVE layer (docker exec into a real
+      # concierge) auto-skips here and is driven by the deploy gate via
+      # MOLECULE_LIVE_CONCIERGE_CONTAINER.
+      - run: python3 -m pytest tests/test_openclaw_concierge_mcp_live_e2e.py -v
       - run: python3 -m pytest tests/ -v
+
+  # --- GUARD D: lockstep pin<->version gate (task #229 / #228) ---
+  # Asserts this image's BAKED mcp-server version (Dockerfile
+  # `ARG MCP_SERVER_VERSION`) == the version the platform-mcp plugin PINS in
+  # its settings-fragment.json SSOT. When the plugin bumps AHEAD of the baked
+  # version, the concierge launches
+  #   npx --prefer-offline @molecule-ai/mcp-server@<PIN>
+  # which MISSES the <BAKED>-only prebake cache and cold-pulls <PIN> — under
+  # CF-WAF throttling that hard-fails ETARGET, so the concierge FALSE-READYs on
+  # every version bump (#228, a recurring deterministic bug). This gate makes
+  # that skew impossible to merge. Pure bash + git + python3 — no docker,
+  # fail-fast in seconds.
+  mcp-pin-lockstep:
+    name: MCP pin<->version lockstep (Guard D)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    needs: validate-static
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Self-test the lockstep lint (network-free, deterministic)
+        # Proves fail-before (RED on a 1.7.0-vs-1.8.1 skew) -> GREEN (lockstep)
+        # on synthetic fixtures, so the guard's behaviour is documented +
+        # regression-proof regardless of the live SSOT state.
+        run: bash scripts/test-lint-mcp-pin-lockstep.sh
+      - name: Fetch the platform-mcp plugin SSOT (pinned mcp-server version)
+        # Same host + auth-free shallow-clone pattern validate-static uses for
+        # molecule-ci. The plugin repo is public; the pin lives in
+        # settings-fragment.json (mcpServers.*.args '@molecule-ai/mcp-server@<v>').
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ai-plugin-molecule-platform-mcp.git .platform-mcp-ssot
+      - name: Assert baked mcp-server == plugin pin (HARD gate)
+        run: bash scripts/lint-mcp-pin-lockstep.sh --dockerfile Dockerfile --fragment .platform-mcp-ssot/settings-fragment.json
 
   validate:
     name: validate
     runs-on: ubuntu-latest
-    needs: [validate-static, validate-runtime, t4-conformance, tests]
+    needs: [validate-static, validate-runtime, t4-conformance, tests, mcp-pin-lockstep]
     timeout-minutes: 1
     steps:
       - name: Aggregate
@@ -253,12 +302,21 @@ jobs:
           runtime="${{ needs.validate-runtime.result }}"
           t4="${{ needs.t4-conformance.result }}"
           tests="${{ needs.tests.result }}"
+          lockstep="${{ needs.mcp-pin-lockstep.result }}"
           echo "validate-static:  $static"
           echo "validate-runtime: $runtime"
           echo "t4-conformance:   $t4"
           echo "tests:            $tests"
+          echo "mcp-pin-lockstep: $lockstep"
           if [ "$static" != "success" ]; then
             echo "::error::validate-static did not succeed: $static"
+            exit 1
+          fi
+          # GUARD D is a HARD gate (task #229): a pin<->bake skew must never
+          # merge. No fork-skip exception — it needs no secrets (public plugin
+          # SSOT clone), so it runs identically on fork PRs.
+          if [ "$lockstep" != "success" ]; then
+            echo "::error::mcp-pin-lockstep did not succeed: $lockstep — the baked mcp-server version is not in lockstep with the platform-mcp plugin pin (Guard D / #228). Failing closed."
             exit 1
           fi
           if [ "$runtime" != "success" ] && [ "$runtime" != "skipped" ]; then
@@ -282,4 +340,4 @@ jobs:
             echo "::error::tests did not succeed: $tests"
             exit 1
           fi
-          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4, tests=$tests)"
+          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4, tests=$tests, mcp-pin-lockstep=$lockstep)"

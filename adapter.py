@@ -17,14 +17,53 @@ import shutil
 import subprocess
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
-from molecule_runtime.adapters.shared_runtime import brief_task, extract_message_text, set_current_task
-from molecule_runtime.executor_helpers import extract_attached_files
-try:
-    from molecule_runtime.attachment_vision import append_image_descriptions
-except ModuleNotFoundError:  # pragma: no cover - older local runtime
-    async def append_image_descriptions(text, files):
-        return text
 from a2a.server.agent_execution import AgentExecutor
+
+# NOTE: the message-extraction / task-brief / attachment / vision helpers
+# (extract_message_text, brief_task, set_current_task, extract_attached_files,
+# append_image_descriptions) are DELIBERATELY not imported here anymore. They
+# were only used by this template's old hand-rolled ``execute()`` override, which
+# has been removed — the shared ``SubprocessA2AExecutor`` base now owns the whole
+# ``execute()`` body (message extraction, image enrichment, session-id, heartbeat)
+# so this adapter stays a THIN subclass and does not duplicate the base's imports.
+
+# Shared subprocess-executor base (tenant-agent BUG 3): the session CONTRACT —
+# a STABLE WORKSPACE_ID-keyed session id so the runtime's native session RESUMES
+# across turns — lives ONCE in the SSOT runtime SDK so every subprocess runtime
+# inherits it. Continuity is that native session, NOT a force-injected transcript:
+# the base passes ONLY the current user message to run_agent (no metadata.history
+# is prepended; older history is retrieved only if the agent chooses to call a
+# platform-workspace MCP tool). OpenClawA2AExecutor below is a thin subclass that
+# provides ONLY the openclaw shell-out (run_agent) + MEDIA adornment; it does NOT
+# override execute() and does NOT inject history.
+from molecule_runtime.subprocess_executor import SubprocessA2AExecutor
+
+# Turn-lease liveness (MUST-FIX 1) is provided by the mailbox-kernel runtime.
+# GUARDED: the template's requirements pin molecule-ai-workspace-runtime>=0.3.11,
+# and wheels predating the mailbox kernel do not ship molecule_runtime.turn_lease
+# — so a hard `from molecule_runtime import turn_lease` would break every turn on
+# an older runtime. Import it optionally; _lease_touch/_lease_reset below no-op
+# when it is absent (or when the kernel is off / no lease installed), so the
+# adapter runs unchanged on old runtimes and renews the lease on new ones.
+try:
+    from molecule_runtime import turn_lease as _turn_lease
+except Exception:  # pragma: no cover - older runtime wheel without the mailbox kernel
+    _turn_lease = None
+
+
+def _lease_reset() -> None:
+    """Arm the process-global turn lease at turn start. No-op when the runtime
+    predates the mailbox kernel (turn_lease absent) or no lease is installed."""
+    if _turn_lease is not None:
+        _turn_lease.reset_current()
+
+
+def _lease_touch() -> None:
+    """Renew the process-global turn lease (turn-lease source D). No-op when the
+    runtime predates the mailbox kernel or no lease is installed."""
+    if _turn_lease is not None:
+        _turn_lease.touch_current()
+
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +77,33 @@ OPENCLAW_PROVIDERS = {
     "moonshot":   (("KIMI_API_KEY",),                       "https://api.moonshot.ai/v1"),
 }
 
-OPENCLAW_WORKSPACE = os.path.expanduser("~/.openclaw/workspace-dev/main")
+def _openclaw_workspace_dir() -> str:
+    """Resolve the workspace dir OpenClaw's gateway ACTUALLY reads SOUL.md from.
+
+    Mirrors openclaw's own ``resolveDefaultAgentWorkspaceDir`` (verified against
+    openclaw 2026.6.11, dist/config-utils): the default agent's workspace is
+    ``~/.openclaw/workspace``, partitioned to ``~/.openclaw/workspace-<profile>``
+    ONLY when ``OPENCLAW_PROFILE`` is set to a non-``default`` value. It is NOT
+    suffixed with the agent id for the default agent.
+
+    The prior literal ``~/.openclaw/workspace-dev/main`` was wrong on BOTH axes:
+    it assumed the gateway's ``--dev`` flag implies ``OPENCLAW_PROFILE=dev`` (it
+    does not — ``--dev`` is a gateway launch mode, orthogonal to the workspace
+    profile) AND it appended a ``/main`` agent-id segment the resolver never adds
+    for the default agent. The materialized SOUL.md therefore landed in a dir the
+    gateway never read, so a fresh openclaw concierge ran the STOCK OpenClaw
+    SOUL.md and self-identified generically. Resolved per-call (like
+    ``_openclaw_config_path``) so it tracks $HOME / OPENCLAW_PROFILE at use time.
+    """
+    profile = (os.environ.get("OPENCLAW_PROFILE") or "").strip().lower()
+    if profile and profile != "default":
+        return os.path.expanduser(f"~/.openclaw/workspace-{profile}")
+    return os.path.expanduser("~/.openclaw/workspace")
+
+
+# The workspace dir OpenClaw reads (SOUL.md et al.). Resolved at import from the
+# same rule the gateway uses; see _openclaw_workspace_dir for the fix rationale.
+OPENCLAW_WORKSPACE = _openclaw_workspace_dir()
 OPENCLAW_PORT = 18789
 # Port for the molecule A2A MCP server (HTTP transport). HTTP is used
 # instead of stdio because a2a_mcp_server's stdio main() blocks on a
@@ -49,6 +114,87 @@ OPENCLAW_MCP_HTTP_PORT = 9100
 
 # Known missing optional deps in OpenClaw's npm package
 OPENCLAW_MISSING_DEPS = ["@buape/carbon", "@larksuiteoapi/node-sdk", "@slack/web-api", "grammy"]
+
+# OpenClaw-native MCP config — ~/.openclaw/openclaw.json  mcp.servers.<name>.
+# This is the file `openclaw mcp set <name> '<json>'` mutates (verified against
+# openclaw@2026.5.7): the stdio descriptor ({command, args?, env?}) nested under
+# mcp.servers.<name>. The adapter renders this file DIRECTLY (see
+# ``_render_openclaw_mcp`` / ``register_mcp_server_hook``) rather than dispatching
+# to the runtime base's ``render_for_runtime`` — the openclaw branch of which is
+# a deliberate fail-loud ``NotImplementedError`` stub on runtime versions that
+# predate the openclaw renderer. Owning the format here keeps the management-MCP
+# install path working on every pinned runtime and makes the present-reader agree
+# with what we wrote (the RCA#2970 gate's "is the management MCP wired?" probe).
+OPENCLAW_MCP_PARENT = "mcp"
+OPENCLAW_MCP_SERVERS = "servers"
+
+
+def _openclaw_config_path() -> str:
+    """Absolute path to ~/.openclaw/openclaw.json, resolved at CALL time.
+
+    Resolved per-call (not frozen at import) so it tracks $HOME — matching the
+    runtime's own ``_openclaw_path`` and the rest of this adapter, which all read
+    ``os.path.expanduser("~/.openclaw/...")`` at use time."""
+    return os.path.expanduser("~/.openclaw/openclaw.json")
+
+
+# Canonical name of the privileged org-management MCP, sourced from the runtime
+# so the adapter's present-reader matches the exact server name the RCA#2970 gate
+# probes for. Falls back to the literal on older runtimes lacking the symbol.
+try:
+    from molecule_runtime.platform_agent_identity import (
+        MANAGEMENT_MCP_NAME as MANAGEMENT_MCP_NAME,
+    )
+except Exception:  # pragma: no cover — older runtime without the constant
+    MANAGEMENT_MCP_NAME = "molecule-platform"
+
+
+def _load_openclaw_config(path: str) -> dict:
+    """Read ~/.openclaw/openclaw.json as a dict; {} on missing/malformed."""
+    try:
+        with open(path) as _f:
+            data = json.load(_f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _render_openclaw_mcp(config_path: str, name: str, spec: dict) -> None:
+    """Additively merge ``name -> spec`` into ~/.openclaw/openclaw.json's
+    ``mcp.servers`` map. Idempotent; preserves every other key + server.
+
+    Produces the exact on-disk shape ``openclaw mcp set <name> '<json>'`` writes
+    (the stdio descriptor under ``mcp.servers.<name>``). Written directly rather
+    than shelling out so it works before the openclaw binary is on PATH and is
+    pure/testable — mirrors the runtime's own ``render_openclaw_config``.
+    """
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    data = _load_openclaw_config(config_path)
+    mcp = data.get(OPENCLAW_MCP_PARENT)
+    if not isinstance(mcp, dict):
+        mcp = {}
+    servers = mcp.get(OPENCLAW_MCP_SERVERS)
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[name] = dict(spec)
+    mcp[OPENCLAW_MCP_SERVERS] = servers
+    data[OPENCLAW_MCP_PARENT] = mcp
+    with open(config_path, "w") as _f:
+        _f.write(json.dumps(data, indent=2) + "\n")
+
+
+def _openclaw_mcp_present(config_path: str, name: str) -> bool:
+    """True when ~/.openclaw/openclaw.json declares ``mcp.servers.<name>``.
+
+    Fail-closed by construction: a missing, unreadable, malformed, or
+    structurally-unexpected config yields False, so a genuinely MCP-less openclaw
+    concierge stays fail-closed (degraded) at the RCA#2970 gate."""
+    data = _load_openclaw_config(config_path)
+    mcp = data.get(OPENCLAW_MCP_PARENT)
+    if not isinstance(mcp, dict):
+        return False
+    servers = mcp.get(OPENCLAW_MCP_SERVERS)
+    return isinstance(servers, dict) and name in servers
 
 # This template's declared default model — mirrors config.yaml's `model:`
 # field. Two hard constraints (both required; routability alone is NOT
@@ -68,46 +214,139 @@ OPENCLAW_MISSING_DEPS = ["@buape/carbon", "@larksuiteoapi/node-sdk", "@slack/web
 #     and aborted setup() before the platform MCP was ever registered —
 #     bricking list_peers on every default-config provision.
 #
-# ``minimax:MiniMax-M2.7`` satisfies both: ``minimax`` is in
-# OPENCLAW_PROVIDERS and its key ``MINIMAX_API_KEY`` is the one fresh
-# openclaw workspaces actually have. The adapter's existing sk-cp-*
-# routing override (step 2b) then steers it onto MiniMax's
-# Anthropic-compat endpoint. It is already a declared, key-consistent
-# entry in config.yaml's runtime_config.models.
-OPENCLAW_DEFAULT_MODEL = "minimax:MiniMax-M2.7"
+# THE single shared platform-default model is the Infisical SSOT
+# ``MOLECULE_LLM_DEFAULT_MODEL`` (/shared/controlplane/llm), read at import. The
+# literal below is only the LAST-RESORT fallback when that env is unset, and it
+# matches the CP/core ``platformDefaultModelFallback`` (minimax/MiniMax-M2.7).
+#
+# Both forms below now derive from the SAME shared value, removing the prior
+# divergence where the BYOK default was MiniMax but the platform default was Kimi
+# (moonshot/kimi-k2.6) — a fresh platform_managed openclaw and a fresh BYOK
+# openclaw now resolve the SAME default, never two different vendors. ``minimax``
+# is in OPENCLAW_PROVIDERS and ``MINIMAX_API_KEY`` is the credential a fresh
+# openclaw workspace actually has (the seeded ``custom-api-minimaxi-com`` sk-cp-*
+# provider; the step-2b routing override steers it to MiniMax's Anthropic-compat
+# endpoint), so the colon-form default is key-consistent on first boot.
+def _ssot_default_model(sep: str) -> str:
+    raw = (os.environ.get("MOLECULE_LLM_DEFAULT_MODEL") or "").strip()
+    if not raw:
+        raw = "minimax/MiniMax-M2.7"  # shared fallback == CP/core platformDefaultModelFallback
+    # openclaw's BYOK registry namespaces as ``<provider>:<model>`` (colon); the
+    # platform proxy uses ``<vendor>/<model>`` (slash). Normalise to the form the
+    # caller needs WITHOUT changing the model identity.
+    return raw.replace("/", ":", 1) if sep == ":" else raw.replace(":", "/", 1)
 
-# Platform-managed LLM default (slash form the proxy resolves to Moonshot/Kimi).
-OPENCLAW_PLATFORM_DEFAULT_MODEL = "moonshot/kimi-k2.6"
+
+# BYOK colon-form default for the per-vendor registry (coerce_servable_model).
+OPENCLAW_DEFAULT_MODEL = _ssot_default_model(":")
+
+# Platform-managed slash-form default for the proxy (resolve_platform_routing).
+OPENCLAW_PLATFORM_DEFAULT_MODEL = _ssot_default_model("/")
+
+
+def _parse_tools_list_body(body: str) -> list[str]:
+    """Extract tool names from a JSON-RPC ``tools/list`` response body.
+
+    Tolerant of the three framings an MCP server may use over stdio/http:
+    a single JSON object, newline-delimited JSON (one object per line, the
+    stdio default), and SSE (``data: {…}`` lines). Returns the names under
+    ``result.tools[].name`` from whichever frame carries them; [] if none.
+    The core#3082 producer keys on these names (``mcp__<server>__<name>``).
+    """
+    candidates: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            line = line[len("data:"):].strip()
+        if not (line.startswith("{") or line.startswith("[")):
+            continue
+        candidates.append(line)
+    # Also try the whole body as one JSON document (single-object http reply).
+    stripped = body.strip()
+    if stripped and stripped not in candidates:
+        candidates.append(stripped)
+
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+        except ValueError:
+            continue
+        result = data.get("result") if isinstance(data, dict) else None
+        tools = result.get("tools") if isinstance(result, dict) else None
+        if isinstance(tools, list):
+            names = [
+                t["name"] for t in tools
+                if isinstance(t, dict) and isinstance(t.get("name"), str) and t.get("name")
+            ]
+            if names:
+                return names
+    return []
 
 
 def resolve_platform_routing(model_str, env):
-    """When the workspace runs in platform_managed LLM billing, route through
+    """When the workspace's resolved provider is ``platform``, route through
     the Molecule platform proxy's OpenAI-compat surface, bypassing the
-    per-vendor colon registry (resolve_provider_routing) entirely — in this
-    mode the tenant has no BYOK key (the workspace-server strips them), so the
-    registry path would raise "No API key found".
+    per-vendor colon registry (resolve_provider_routing) entirely — for the
+    platform arm the tenant has no BYOK key (the workspace-server strips them),
+    so the registry path would raise "No API key found".
 
-    Returns (api_key, provider_url, model, compatibility) or None when not
-    platform_managed. Raises RuntimeError if platform_managed but unconfigured
-    (fail closed rather than fall through to a keyless registry route).
+    Provider selection is flag-free — ``platform`` is selected the same way any
+    other provider is, by the resolved provider, NOT by a billing-mode env.
 
-    The model id is sent verbatim (a leading "platform/" namespace marker is
-    stripped); the proxy keys on the vendor prefix (moonshot/..., minimax/...,
-    anthropic/..., openai/...). Mirrors the proven smoke
-    (molecule-controlplane scripts/e2e-llm-kimi-smoke.sh).
+    ``MOLECULE_RESOLVED_PROVIDER`` is the SSOT signal and the TOP-PRECEDENCE
+    explicit provider: core's provisioner resolves the provider ONCE (Go
+    ``manifest.DeriveProvider``) and publishes the registry arm name here for
+    every layer to READ, never re-derive. When it is set it is authoritative —
+    ``platform`` is selected iff its value is exactly ``platform``; any other
+    (byok) arm means NOT platform and the model namespace must NOT re-promote it
+    to platform. Only when the SSOT signal is ABSENT do we fall back to the
+    legacy signals (back-compat for old provisioners):
+      * ``LLM_PROVIDER``/``MODEL_PROVIDER`` env == ``platform`` (core injected
+        ``LLM_PROVIDER=platform`` for platform-routed workspaces), or
+      * a ``platform/`` / ``platform:`` model namespace marker.
+
+    Returns (api_key, provider_url, model, compatibility) or None when the
+    resolved provider is not ``platform``. Raises RuntimeError if it IS
+    platform but the proxy env is unconfigured (fail closed rather than fall
+    through to a keyless registry route).
+
+    The model id is sent verbatim (a leading "platform/" / "platform:"
+    namespace marker is stripped); the proxy keys on the vendor prefix
+    (moonshot/..., minimax/..., anthropic/..., openai/...). Mirrors the proven
+    smoke (molecule-controlplane scripts/e2e-llm-kimi-smoke.sh).
     """
-    if env.get("MOLECULE_LLM_BILLING_MODE") != "platform_managed":
+    model = (model_str or "").strip()
+    resolved = (env.get("MOLECULE_RESOLVED_PROVIDER") or "").strip().lower()
+    if resolved:
+        # SSOT signal present: it is authoritative (top precedence). Route
+        # platform iff the resolved arm name is exactly ``platform``; any other
+        # arm is BYOK and must NOT be re-derived from LLM_PROVIDER/MODEL_PROVIDER
+        # or the model namespace.
+        is_platform = (resolved == "platform")
+    else:
+        # Back-compat: no SSOT signal — fall back to the legacy LLM_PROVIDER/
+        # MODEL_PROVIDER env or the ``platform/`` / ``platform:`` model marker.
+        env_provider = (env.get("LLM_PROVIDER") or env.get("MODEL_PROVIDER") or "").strip().lower()
+        is_platform = (
+            env_provider == "platform"
+            or model.startswith("platform/")
+            or model.startswith("platform:")
+        )
+    if not is_platform:
         return None
     base = env.get("MOLECULE_LLM_BASE_URL") or env.get("OPENAI_BASE_URL")
     token = env.get("MOLECULE_LLM_USAGE_TOKEN") or env.get("ANTHROPIC_API_KEY")
     if not base or not token:
         raise RuntimeError(
-            "platform_managed LLM billing but MOLECULE_LLM_BASE_URL / usage token "
-            "is unset — refusing to fall back to a keyless BYOK route"
+            "resolved provider is `platform` but MOLECULE_LLM_BASE_URL / usage "
+            "token is unset — refusing to fall back to a keyless BYOK route"
         )
-    model = (model_str or "").strip()
     if model.startswith("platform/"):
         model = model[len("platform/"):]
+    elif model.startswith("platform:"):
+        model = model[len("platform:"):]
     if not model:
         model = OPENCLAW_PLATFORM_DEFAULT_MODEL
     return token, base, model, "openai"
@@ -159,6 +398,43 @@ def coerce_servable_model(model_str: str) -> str:
         model_str, prefix, ",".join(sorted(OPENCLAW_PROVIDERS)), OPENCLAW_DEFAULT_MODEL,
     )
     return OPENCLAW_DEFAULT_MODEL
+
+
+# Clean status line shown when an openclaw turn aborts / times out with NO
+# assistant text at all (e.g. aborted mid-tool-use before any visible text was
+# produced). Deliberately generic + reassuring — an orchestration turn that hits
+# the per-turn cap while delegating is still "working", so tell the user that
+# rather than dumping the raw envelope or an "error".
+_OPENCLAW_ABORT_STATUS_TEXT = (
+    "Working on it — delegating to the team; a consolidated update is on the way."
+)
+
+
+def _clean_reply_from_envelope(result: dict, data: dict) -> str:
+    """Derive a USER-SAFE reply from a payload-less openclaw ``agent --json``
+    envelope (aborted / timed-out run), never the raw run-result object.
+
+    OpenClaw's envelope carries the assistant's own text in
+    ``finalAssistantVisibleText`` (and a raw variant in
+    ``finalAssistantRawText``) even when the run aborts at the per-turn cap and
+    emits no ``result.payloads`` entry. We surface that clean text in preference
+    order; only when the engine produced no visible text at all do we fall back
+    to a clean status line. We NEVER return ``str(data)`` — that stringifies the
+    whole run-result (runId/meta/systemPromptReport/tools/executionTrace/…) into
+    the user's chat, which is the demo-critical raw-JSON-dump bug this guards.
+
+    ``finalAssistant*`` normally live under ``result`` (sibling of ``payloads``),
+    but we also check top-level ``data`` defensively in case a future envelope
+    hoists them.
+    """
+    for src in (result, data):
+        if not isinstance(src, dict):
+            continue
+        for key in ("finalAssistantVisibleText", "finalAssistantRawText"):
+            val = src.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return _OPENCLAW_ABORT_STATUS_TEXT
 
 
 class OpenClawAdapter(BaseAdapter):
@@ -229,10 +505,11 @@ class OpenClawAdapter(BaseAdapter):
         # from the shared runtime's load_config) reach a registry that has
         # no `anthropic` entry — that bricks fresh provisions. See
         # coerce_servable_model for the full rationale.
-        # Platform-managed billing short-circuits the per-vendor colon
-        # registry: route everything through the Molecule proxy. Checked
-        # BEFORE resolve_provider_routing, which would raise on the
-        # stripped-key (no-BYOK) platform environment.
+        # A resolved provider of `platform` short-circuits the per-vendor
+        # colon registry: route everything through the Molecule proxy. Selected
+        # by provider==platform (LLM_PROVIDER/model namespace), NOT a
+        # billing-mode env. Checked BEFORE resolve_provider_routing, which would
+        # raise on the stripped-key (no-BYOK) platform environment.
         _pm = resolve_platform_routing(config.model, os.environ)
         if _pm is not None:
             api_key, provider_url, model, compatibility = _pm
@@ -371,12 +648,15 @@ class OpenClawAdapter(BaseAdapter):
         #
         # The probe matches the SAME wire shape the gateway will use:
         #  - anthropic-compat routes -> POST {base}/v1/messages with
-        #    `anthropic-version` + `x-api-key`. For the Kimi-For-Coding
-        #    gateway we ALSO send a `claude-cli/*` User-Agent, because
-        #    that endpoint 403s non-coding-agent UAs — probing with the
-        #    same UA openclaw's Anthropic shim sends proves end-to-end
-        #    reachability (auth AND the UA allowlist), not just network.
+        #    `anthropic-version` + `x-api-key`.
         #  - openai-compat routes -> POST {base}/chat/completions.
+        # ALL routes send a coding-agent `User-Agent` (set just before the
+        # request is built). The CP proxy is Cloudflare-fronted and the default
+        # `Python-urllib/*` UA trips Cloudflare's browser-integrity rule (403,
+        # edge error 1010) — and the Kimi-For-Coding gateway 403s non-coding-
+        # agent UAs too. Mirroring the UA the real gateway sends proves
+        # end-to-end reachability (auth AND the edge/UA allowlist), not just
+        # network, and stops a false 403 from bricking a working concierge.
         try:
             import urllib.request as _urlreq
             import urllib.error as _urlerr
@@ -387,10 +667,6 @@ class OpenClawAdapter(BaseAdapter):
                     "x-api-key": api_key,
                     "content-type": "application/json",
                 }
-                # Kimi-For-Coding gates on a coding-agent UA; openclaw's
-                # Anthropic SDK shim sends claude-cli/* so we mirror it.
-                if "api.kimi.com" in provider_url:
-                    _probe_headers["user-agent"] = "claude-cli/1.0 (molecule-openclaw boot-probe)"
                 _probe_body = json.dumps({
                     "model": model.split(":", 1)[-1],
                     "max_tokens": 1,
@@ -409,6 +685,15 @@ class OpenClawAdapter(BaseAdapter):
                     "max_tokens": 1,
                     "messages": [{"role": "user", "content": "ping"}],
                 }).encode()
+            # The CP LLM proxy sits behind Cloudflare. Cloudflare's browser-
+            # integrity edge rule 403s a default `Python-urllib/*` User-Agent
+            # with error 1010 — a BROWSER-SIGNATURE ban, NOT an LLM-auth failure.
+            # Without a real UA this fail-closed probe bricks the concierge even
+            # though the gateway's own traffic (Node / claude-cli UA) is served
+            # fine. Send the SAME coding-agent UA the real gateway uses so the
+            # probe traverses the identical edge path the live traffic will (this
+            # also satisfies the Kimi-For-Coding coding-agent-UA allowlist).
+            _probe_headers.setdefault("user-agent", "claude-cli/1.0 (molecule-openclaw boot-probe)")
             _req = _urlreq.Request(_probe_url, data=_probe_body, headers=_probe_headers, method="POST")
             try:
                 with _urlreq.urlopen(_req, timeout=10) as _resp:
@@ -420,9 +705,10 @@ class OpenClawAdapter(BaseAdapter):
                         f"Upstream auth smoke probe rejected the configured key at "
                         f"{_probe_url} (HTTP {_he.code}). The provider credential and "
                         f"provider_url={provider_url} are incompatible "
-                        f"(HTTP 403 on api.kimi.com also indicates a blocked "
-                        f"User-Agent). Fix the secret or the routing override in "
-                        f"adapter.py before this workspace can chat."
+                        f"(a 403 may also be a Cloudflare edge UA ban — error "
+                        f"1010 — or, on api.kimi.com, a blocked User-Agent). Fix "
+                        f"the secret or the routing override in adapter.py before "
+                        f"this workspace can chat."
                     )
                 logger.warning(
                     f"Upstream auth smoke probe non-fatal failure at {_probe_url}: "
@@ -474,6 +760,38 @@ class OpenClawAdapter(BaseAdapter):
         # Diagnosed 2026-05-15 on prod workspace
         # ced1e6b2-b680-4314-816d-2d0cf6b12f71.
         await self._setup_molecule_mcp()
+
+        # 4c. Install DECLARED plugins via the base per-runtime pipeline (P4).
+        #
+        # Until now this template called the plugin pipeline ZERO times — a dead
+        # pipeline. The single hardcoded `_setup_molecule_mcp` above wires only
+        # the in-process A2A peer-discovery sidecar (`molecule`, HTTP); it does
+        # NOT consume any plugin the org DECLARES in config.yaml. The privileged
+        # org-management MCP (`molecule-platform-mcp` → `@molecule-ai/mcp-server`,
+        # the create_workspace / org-admin tooling a CONCIERGE needs) is delivered
+        # as a declared plugin, so without this call an openclaw concierge boots
+        # with peer-discovery but NO management MCP — exactly the cross-runtime
+        # gap P4 closes.
+        #
+        # `install_plugins_via_registry` is the LOOP over declared MCP plugins:
+        # for each one it resolves MCPServerAdaptor (runtime-agnostic) →
+        # register_mcp_server_hook (our openclaw override below) →
+        # mcp_render.render_for_runtime("openclaw", …), which writes the stdio
+        # descriptor into ~/.openclaw/openclaw.json `mcp.servers.<name>` (the file
+        # `openclaw mcp set` mutates and the gateway re-reads at start in step 5).
+        # A privileged-plugin failure raises PrivilegedPluginInstallError so a
+        # management-MCP-less concierge fails CLOSED + loudly rather than silent.
+        await self._install_declared_mcp_plugins(config)
+
+        # 4d. Materialize the ASSEMBLED platform system prompt into the SOUL.md the
+        #     gateway reads. Runs AFTER 4c on purpose: the orchestrator-only
+        #     guardrail is gated on the management MCP being wired
+        #     (mcp_server_present), which 4c is what installs — so a concierge
+        #     reports True here and gets gagged from self-executing, while a worker
+        #     reports False and keeps doing real work. This is what turns a fresh
+        #     openclaw concierge from generic ("I don't have an identity yet") into
+        #     the Org Concierge orchestrator (persona + peers + coordinator + guardrail).
+        await self._materialize_persona_into_soul(config)
 
         # 5. Start the gateway as a background process
         gateway_port = config.runtime_config.get("gateway_port", OPENCLAW_PORT)
@@ -639,6 +957,143 @@ class OpenClawAdapter(BaseAdapter):
                 "scope grant will be applied lazily by execute() fallback"
             )
 
+        # 7. Publish the LOADED MCP tool inventory for the core#3082 gate.
+        #
+        # The platform online/degraded gate (core#3082) wants proof the
+        # management MCP's tools were ACTUALLY LOADED (not merely declared). We
+        # report the INVENTORY — the tools the registered MCP servers EXPOSE,
+        # enumerated once here after the gateway is healthy — NOT the tools the
+        # model happened to invoke in a turn. That distinction is the #142/#3082-
+        # class bug the fleet just RC'd on codex's per-turn producer: a healthy
+        # turn that calls no MCP tool publishes [] and DEGRADES a healthy
+        # concierge. An inventory taken from the live server can't false-empty on
+        # a tool-less turn. Fail-soft: an enumeration failure publishes nothing
+        # (stays None → fail-closed degraded), never a guessed/static list and
+        # never an exception into boot.
+        await self._publish_loaded_mcp_inventory()
+
+    async def _publish_loaded_mcp_inventory(self):
+        """Enumerate the tools the registered MCP servers EXPOSE and publish them
+        to the core#3082 ``loaded_mcp_tools`` producer (inventory, not per-turn).
+
+        Reads the registered servers from ~/.openclaw/openclaw.json
+        (``mcp.servers``) and, for each STDIO server, runs a one-shot
+        ``initialize`` + ``tools/list`` JSON-RPC handshake against the SAME
+        command openclaw spawns to get the ground-truth tool list. Publishes the
+        union as ``mcp__<server>__<tool>`` ids (matching the prefix the gate
+        consumes). HTTP servers (the a2a `molecule` sidecar) are enumerated over
+        their URL. Best-effort: any failure leaves the producer at its prior
+        value (None until proven), so the gate stays fail-closed rather than
+        seeing a guessed list.
+        """
+        try:
+            from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+        except Exception:  # pragma: no cover — older base image without the producer
+            return
+
+        oc_config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+        try:
+            with open(oc_config_path) as _f:
+                servers = (json.load(_f).get("mcp") or {}).get("servers") or {}
+        except (OSError, ValueError) as e:
+            logger.debug("loaded_mcp_tools: could not read openclaw.json: %s", e)
+            return
+        if not isinstance(servers, dict) or not servers:
+            return
+
+        tool_ids: list[str] = []
+        for server_name, spec in servers.items():
+            if not isinstance(spec, dict):
+                continue
+            try:
+                names = await self._list_mcp_tools(spec)
+            except Exception as e:  # noqa: BLE001 — best-effort enumeration
+                logger.debug("loaded_mcp_tools: enumerate %r failed: %s", server_name, e)
+                names = []
+            for tool in names:
+                tool_ids.append(f"mcp__{server_name}__{tool}")
+
+        if not tool_ids:
+            # Nothing enumerated — do NOT publish a guessed/empty list; leave the
+            # producer at None so the gate stays fail-closed (degraded) until a
+            # real inventory is observed (matches the producer contract).
+            logger.info(
+                "loaded_mcp_tools: no MCP tools enumerated from %d registered "
+                "server(s); leaving producer unset (gate stays fail-closed)",
+                len(servers),
+            )
+            return
+        try:
+            set_loaded_mcp_tools(sorted(set(tool_ids)))
+            logger.info(
+                "loaded_mcp_tools: published %d-tool inventory from %d server(s)",
+                len(set(tool_ids)), len(servers),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("loaded_mcp_tools: publish failed: %s", e)
+
+    async def _list_mcp_tools(self, spec: dict) -> list[str]:
+        """One-shot ``initialize`` + ``tools/list`` against a registered MCP
+        server, returning the tool names it exposes. Supports the stdio
+        (``{command, args?, env?}``) and http (``{type:http, url}``) shapes
+        openclaw stores. Returns [] on any failure (caller logs)."""
+        init_req = {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "openclaw-inventory", "version": "1"},
+            },
+        }
+        list_req = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+
+        url = spec.get("url")
+        if url:
+            # HTTP transport (the a2a sidecar). Enumerate over the URL.
+            import urllib.request
+            tools: list[str] = []
+            for req_body in (init_req, list_req):
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(req_body).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    body = resp.read().decode(errors="replace")
+                if req_body is list_req:
+                    tools = _parse_tools_list_body(body)
+            return tools
+
+        command = spec.get("command")
+        if not command:
+            return []
+        args = spec.get("args") or []
+        child_env = os.environ.copy()
+        child_env.setdefault("PATH", f"{os.path.expanduser('~/.local/bin')}:/usr/local/bin:/usr/bin:/bin")
+        child_env.update({k: str(v) for k, v in (spec.get("env") or {}).items()})
+
+        proc = await asyncio.create_subprocess_exec(
+            command, *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=child_env,
+        )
+        # Newline-delimited JSON-RPC over stdio: send initialize + tools/list,
+        # close stdin, read all stdout. A one-shot enumeration, then the child
+        # exits at EOF — we don't keep this process (openclaw owns the real one).
+        payload = (json.dumps(init_req) + "\n" + json.dumps(list_req) + "\n").encode()
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(payload), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return []
+        return _parse_tools_list_body(stdout.decode(errors="replace"))
+
     async def _setup_molecule_mcp(self):
         """Start the molecule A2A MCP server (HTTP transport) as a
         supervised sidecar and register it with OpenClaw.
@@ -732,8 +1187,216 @@ class OpenClawAdapter(BaseAdapter):
             )
         logger.info("Registered molecule MCP server with OpenClaw")
 
+    async def _materialize_persona_into_soul(self, config: AdapterConfig) -> None:
+        """Assemble the FULL platform system prompt and write it into the SOUL.md
+        the openclaw gateway reads, so a fresh concierge boots AS its delivered
+        persona rather than the stock OpenClaw SOUL.md.
+
+        The step-4 raw ``/configs/*.md`` copy was insufficient on three counts,
+        all fixed here:
+
+          * it NEVER called ``build_system_prompt`` — so the orchestrator-only
+            guardrail ("you NEVER do the work yourself"), the resolved platform
+            instructions, the peer roster, and the coordinator/children context
+            were absent from the model's on-disk identity;
+          * it wrote to the wrong dir (fixed by ``_openclaw_workspace_dir``); and
+          * the concierge persona is delivered at ``/configs/prompts/concierge.md``
+            — a SUBDIR the top-level ``*.md`` copy skips — which
+            ``build_system_prompt`` loads via ``config.prompt_files``.
+
+        This is the openclaw arm of the base runtime's persona-materialization
+        contract (``_common_setup`` -> ``build_system_prompt`` -> native identity
+        file: claude-code=system-prompt.md, openclaw=SOUL.md). We assemble here
+        rather than calling ``_common_setup`` wholesale so we do NOT re-run the
+        openclaw MCP install pipeline (owned by ``_install_declared_mcp_plugins``).
+
+        Best-effort by design (mirrors the runtime port): any failure logs loudly
+        but never bricks boot — the raw copied SOUL.md remains as a fallback.
+        """
+        try:
+            from molecule_runtime.prompt import (
+                build_system_prompt,
+                get_peer_capabilities,
+                get_platform_instructions,
+            )
+            from molecule_runtime.skill_loader.loader import load_skills
+        except Exception as e:  # noqa: BLE001 — older runtime wheel: leave raw SOUL.md
+            logger.warning(
+                "openclaw persona: runtime prompt builder unavailable (%s); "
+                "leaving raw SOUL.md in place", e,
+            )
+            return
+
+        platform_url = os.environ.get("PLATFORM_URL", "http://host.docker.internal:8080")
+
+        # Skills declared for this workspace (runtime-filtered). Fail-open to none.
+        try:
+            loaded_skills = load_skills(
+                config.config_path, getattr(config, "tools", []) or [],
+                current_runtime=self.name(),
+            )
+        except Exception:  # noqa: BLE001
+            loaded_skills = []
+
+        # Peer roster + resolved platform instructions (both fail-open to empty
+        # inside the runtime helpers, so a platform blip never bricks boot).
+        peers = await get_peer_capabilities(platform_url, config.workspace_id)
+        platform_instructions = await get_platform_instructions(platform_url, config.workspace_id)
+
+        # Coordinator/children context (a parent-of-a-team concierge) — same source
+        # the base _common_setup uses. Absent/empty for a leaf workspace.
+        extra_prompts: list[str] = []
+        try:
+            from molecule_runtime.coordinator import get_children, build_children_description
+            children = await get_children()
+            if children:
+                extra_prompts.append(build_children_description(children))
+        except Exception:  # noqa: BLE001 — coordinator context is additive, never required
+            pass
+
+        # Orchestrator-only guardrail gate (platform/concierge ONLY). Ask the
+        # runtime whether the privileged management MCP is wired into openclaw's
+        # native config — True on a concierge (4c installed it), False on a worker.
+        # Default to worker (no guardrail) on any error so a worker is never gagged.
+        try:
+            from molecule_runtime.platform_agent_identity import mcp_server_present
+            is_platform_agent = mcp_server_present()
+        except Exception:  # noqa: BLE001
+            is_platform_agent = False
+
+        assembled = build_system_prompt(
+            config.config_path,
+            config.workspace_id,
+            loaded_skills,
+            peers,
+            prompt_files=getattr(config, "prompt_files", None) or None,
+            plugin_prompts=extra_prompts or None,
+            platform_instructions=platform_instructions,
+            platform_guardrail=is_platform_agent,
+        )
+
+        # SSOT: publish the single assembled prompt back onto the shared config so
+        # any later reader agrees with what the gateway loads.
+        config.system_prompt = assembled
+
+        os.makedirs(OPENCLAW_WORKSPACE, exist_ok=True)
+        soul_path = os.path.join(OPENCLAW_WORKSPACE, "SOUL.md")
+        with open(soul_path, "w") as fh:
+            fh.write(assembled if assembled.endswith("\n") else assembled + "\n")
+        logger.info(
+            "openclaw persona: wrote assembled system prompt to %s "
+            "(%d chars, guardrail=%s, %d peer(s), %d skill(s))",
+            soul_path, len(assembled), is_platform_agent, len(peers), len(loaded_skills),
+        )
+
+    async def _install_declared_mcp_plugins(self, config: AdapterConfig):
+        """Drive the base per-runtime plugin pipeline for declared plugins (P4).
+
+        Loads plugins from the per-workspace dir (+ shared fallback) and runs
+        ``install_plugins_via_registry``. For an MCP-server plugin (the privileged
+        ``molecule-platform-mcp`` a concierge declares) this resolves
+        MCPServerAdaptor → ``register_mcp_server_hook`` (overridden below) →
+        ``mcp_render.render_for_runtime("openclaw", …)``, rendering the
+        ``[mcp.servers.<name>]`` stdio entry into ~/.openclaw/openclaw.json.
+
+        Mirrors the codex adapter's identical call from its own setup(). Without
+        it the declared management MCP is NEVER written for openclaw, so the
+        concierge boots without create_workspace (the #3159 class of bug — here:
+        not wired at all). A PrivilegedPluginInstallError propagates so a
+        management-MCP-less concierge fails closed + loudly.
+        """
+        from molecule_runtime.plugins import load_plugins
+
+        workspace_plugins_dir = os.path.join(config.config_path, "plugins")
+        plugins = load_plugins(
+            workspace_plugins_dir=workspace_plugins_dir,
+            shared_plugins_dir=os.environ.get("PLUGINS_DIR", "/plugins"),
+        )
+        if plugins.plugin_names:
+            logger.info("openclaw: installing declared plugins: %s",
+                        ", ".join(plugins.plugin_names))
+        await self.install_plugins_via_registry(config, plugins)
+
+    def register_mcp_server_hook(self, config, name, spec):
+        """OpenClaw MCP-wiring PORT override: render the openclaw-native config.
+
+        Writes the stdio descriptor into ~/.openclaw/openclaw.json
+        ``mcp.servers.<name>`` — the same on-disk shape ``openclaw mcp set``
+        produces — NOT ``.claude/settings.json`` (the #3159 mis-attribution where
+        an openclaw concierge's management MCP is rendered into, and judged
+        against, a file its runtime never reads).
+
+        We render DIRECTLY here rather than delegating to the base hook's
+        ``mcp_render.render_for_runtime("openclaw", …)``: that dispatch is a
+        deliberate fail-loud ``NotImplementedError`` stub on runtime versions that
+        predate the openclaw renderer (format-unverified, phase P4), which would
+        crash the management-MCP install on any not-yet-graduated runtime even
+        though we DO know the format. Owning the renderer in the template keeps the
+        install path working across pinned runtime versions and keeps it byte-shape
+        identical to the runtime's own ``render_openclaw_config``.
+
+        OpenClaw spawns each stdio MCP server as a child and passes the
+        descriptor's ``env`` block to it. The management MCP
+        (``@molecule-ai/mcp-server``) reads MOLECULE_CP_URL + MOLECULE_ADMIN_TOKEN
+        to reach the controlplane; if they aren't in the descriptor's env,
+        create_workspace 401s/no-ops even though the server is declared. So we
+        resolve those values at install time and merge them as LITERALS into the
+        spec's ``env`` before writing — the exact pattern the codex adapter uses
+        for its config.toml env sub-table. Descriptor-declared keys (e.g.
+        MOLECULE_MCP_MODE) win and are never overwritten.
+        """
+        spec = dict(spec)
+        descriptor_env = dict(spec.get("env") or {})
+        for key in (
+            "MOLECULE_CP_URL",
+            "MOLECULE_ADMIN_TOKEN",
+            "MOLECULE_API_URL",
+            "MOLECULE_API_KEY",
+            "MOLECULE_ORG_API_KEY",
+            "MOLECULE_ORG_SLUG",
+            "MOLECULE_AUDIT_ACTOR",
+            "PLATFORM_URL",
+            "WORKSPACE_ID",
+            "MOLECULE_ORG_ID",
+        ):
+            if key in descriptor_env:
+                continue
+            val = os.environ.get(key)
+            if val:
+                descriptor_env[key] = val
+        if descriptor_env:
+            spec["env"] = descriptor_env
+        config_path = _openclaw_config_path()
+        _render_openclaw_mcp(config_path, name, spec)
+        logger.info(
+            "register_mcp_server_hook: wired MCP %r into %s (runtime=openclaw)",
+            name, config_path,
+        )
+
+    def management_mcp_present(self, config) -> bool:
+        """True when the privileged management MCP is wired into openclaw's native
+        config (~/.openclaw/openclaw.json ``mcp.servers``).
+
+        Runtime-agnostic answer to the RCA#2970 online gate's "is the management
+        MCP wired?" probe, judged against the file openclaw actually reads rather
+        than a Claude settings.json it never reads (#3159). Overrides the base —
+        which dispatches to the runtime's present-reader — for the same reason
+        ``register_mcp_server_hook`` does: on runtimes predating the openclaw
+        renderer the base present-reader reports False even after we wrote the
+        file, disagreeing with what the renderer produced.
+
+        Fail-closed by construction (a missing/malformed config yields False), so
+        a genuinely MCP-less concierge stays degraded at the gate."""
+        return _openclaw_mcp_present(_openclaw_config_path(), MANAGEMENT_MCP_NAME)
+
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
-        return OpenClawA2AExecutor(heartbeat=config.heartbeat)
+        # Pass the workspace identity so the shared base derives a STABLE,
+        # workspace-keyed session id (not the per-request context_id the a2a-sdk
+        # mints fresh each turn) — tenant-agent BUG 3.
+        return OpenClawA2AExecutor(
+            workspace_id=getattr(config, "workspace_id", "") or "",
+            heartbeat=config.heartbeat,
+        )
 
 
 def _oc_text(content) -> str:
@@ -826,22 +1489,95 @@ def _openclaw_steps(data: dict) -> list:
         return []
 
 
-class OpenClawA2AExecutor(AgentExecutor):
-    """Proxies A2A messages to OpenClaw via `openclaw agent` CLI subprocess."""
+async def _communicate_touching_lease(proc, *, timeout):
+    """Drain ``proc``'s stdout+stderr to EOF while renewing the turn lease on
+    every chunk, then wait for exit. Drop-in for
+    ``asyncio.wait_for(proc.communicate(), timeout)`` returning
+    ``(stdout_bytes, stderr_bytes)``.
 
-    def __init__(self, heartbeat=None):
-        self._heartbeat = heartbeat
-        # Ordered turn steps (SSOT AgentTrace.steps) the shared TracingExecutor
-        # reads; populated per turn from openclaw's --json transcript.
-        self._last_steps = []
+    This is turn-lease SOURCE D (subprocess-output liveness): the OpenClaw
+    executor spawns ``openclaw agent`` as a subprocess and blocks on it, so it
+    never runs the native runtime's ``on_tool_start``/``on_tool_end`` lease
+    touches (source A) and openclaw does not write
+    ``MOLECULE_TOOL_ACTIVITY_FILE`` (source C) — leaving a long OpenClaw turn
+    with NO lease renewal. Any bytes the child emits on stdout/stderr are a
+    proxy for "still working", so each chunk calls ``turn_lease.touch_current()``
+    and keeps the lease fresh (up to its TTL / absolute cap). The plain
+    ``communicate()`` buffered ALL output until exit, so no incremental signal
+    ever reached the lease.
 
-    async def execute(self, context, event_queue):
-        from a2a.helpers import new_text_message
+    ``turn_lease.touch_current()`` is a no-op when the mailbox kernel is off (no
+    lease installed), so the default (non-kernel) flow is behaviourally
+    identical to ``communicate()`` — it just reads incrementally.
 
-        user_message = extract_message_text(context)
-        attached = extract_attached_files(getattr(context, "message", None))
-        if attached:
-            user_message = await append_image_descriptions(user_message, attached)
+    ``timeout`` is a wall-clock cap over the whole read+wait. On timeout the
+    child is killed (closing the leak the old ``wait_for(communicate())`` left —
+    it cancelled the read but left the process running) and
+    ``asyncio.TimeoutError`` is re-raised so the caller's existing timeout
+    branch is unchanged.
+    """
+    out = bytearray()
+    err = bytearray()
+
+    async def _pump(stream, sink):
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            sink.extend(chunk)
+            # Source D: incremental subprocess output renews the lease. No-op
+            # when no lease is installed (mailbox kernel off) or the runtime
+            # predates the mailbox kernel.
+            _lease_touch()
+
+    async def _drain_and_wait():
+        await asyncio.gather(_pump(proc.stdout, out), _pump(proc.stderr, err))
+        await proc.wait()
+
+    try:
+        await asyncio.wait_for(_drain_and_wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:  # noqa: BLE001 — reaping the killed child must not mask the timeout
+            pass
+        raise
+    return bytes(out), bytes(err)
+
+
+class OpenClawA2AExecutor(SubprocessA2AExecutor):
+    """Shells A2A turns out to the ``openclaw agent`` CLI subprocess.
+
+    tenant-agent BUG 3: the SESSION contract is INHERITED from
+    ``SubprocessA2AExecutor`` — the openclaw ``--session-id`` is derived from the
+    STABLE workspace identity (not the per-request ``context_id`` the a2a-sdk mints
+    fresh each turn), so openclaw's native session RESUMES across turns. Continuity
+    is that native session; conversation history is NOT force-injected into the
+    task text — the base passes ONLY the current user message to ``run_agent``, and
+    older history is retrieved only if the agent chooses to call a platform-workspace
+    MCP tool. This class provides ONLY:
+
+      * ``_decorate_message`` — the openclaw ``MEDIA:`` image lines, and
+      * ``run_agent``         — the ``openclaw agent`` shell-out (+ turn-lease
+                                liveness + the scope-upgrade self-heal retry).
+
+    It MUST NOT override ``execute()``; the contract lives in the base and is
+    guarded by the shared contract test.
+    """
+
+    runtime_label = "OpenClaw"
+
+    def _decorate_message(self, user_message, attached):
+        # Surface image attachments to OpenClaw's media parser via MEDIA: lines.
+        # Adorns the CURRENT user message only; the base does not prepend any
+        # prior-turn transcript, so what reaches the CLI is this turn's message
+        # plus its media refs (continuity is openclaw's own resumed session).
         image_media_lines = [
             f"MEDIA: {f['path']}"
             for f in attached
@@ -849,69 +1585,86 @@ class OpenClawA2AExecutor(AgentExecutor):
         ]
         if image_media_lines:
             user_message = (
-                user_message.rstrip()
-                + "\n\n"
-                + "\n".join(image_media_lines)
+                user_message.rstrip() + "\n\n" + "\n".join(image_media_lines)
             ).strip()
+        return user_message
 
-        if not user_message:
-            await event_queue.enqueue_event(new_text_message("No message provided"))
-            return
+    async def run_agent(self, task_text, session_id, context):
+        # Arm the turn lease (MUST-FIX 1) at the start of this OpenClaw turn.
+        # OpenClaw runs its whole turn inside a single blocking `openclaw agent`
+        # subprocess and never enters the native runtime's astream/idle-cap +
+        # on_tool_start/end lease-touch path, so without this the lease is never
+        # reset per turn. No-op when the mailbox kernel is off / the runtime
+        # predates it. The lease is then renewed on subprocess output (source D)
+        # by _communicate_touching_lease below.
+        _lease_reset()
+        # Ordered turn steps (SSOT AgentTrace.steps) the shared TracingExecutor
+        # reads; reset per turn so a JSON parse failure cannot leak prior steps.
+        self._last_steps = []
 
-        await set_current_task(self._heartbeat, brief_task(user_message))
-
-        # Derive a STABLE session id for openclaw's native SessionManager
-        # (pi-embedded-runner/run/attempt.ts:1655). Per RFC #600
-        # (https://git.moleculesai.app/molecule-ai/internal/issues/600):
-        # the platform must NOT ship message history; the agent owns the
-        # session by its own key. a2a-sdk semantics: context_id is the
-        # cross-turn conversation key (stable across messages in the same
-        # chat); task_id changes per task — so using task_id resets the
-        # openclaw session every turn, defeating native continuity.
-        # Fall back to task_id only if context_id is unset (legacy clients).
-        session_id = (
-            getattr(context, "context_id", None)
-            or getattr(context, "task_id", None)
-            or "default"
-        )
-
+        # task_text is the CURRENT user message only (+ any MEDIA: lines from
+        # _decorate_message) — the base does NOT inject conversation history;
+        # continuity comes from openclaw resuming the native session keyed on
+        # session_id, the STABLE workspace-keyed id (base: derive_session_id).
+        #
         # Call OpenClaw agent via CLI, retrying once if we hit the
         # scope-upgrade-pending gate. The priming step in setup() should
         # cover steady-state, but openclaw can re-request scopes after
         # gateway restarts, session expiry, or a CLI version bump. The
-        # retry-with-approve here makes execute() self-healing so a
-        # single canvas message can recover from a stale pairing without
-        # needing a workspace restart.
+        # retry-with-approve here makes the turn self-healing so a single
+        # canvas message can recover from a stale pairing without a restart.
         reply = None
+        # OpenClaw's gateway rejects a --session-id containing ':' with
+        # "Invalid session ID" (GatewayClientRequestError), which fails EVERY
+        # A2A turn on an openclaw concierge. The shared derive_session_id emits
+        # the stable "workspace:<uuid>" form (fine for claude-code/codex/hermes
+        # native sessions). Map ':' -> '-' for the OpenClaw CLI only: the mapping
+        # is DETERMINISTIC so the native session still RESUMES across turns, and
+        # "workspace-<uuid>" is accepted by the gateway (verified on a live
+        # baked concierge: colon form -> Invalid session ID; dash form -> ok).
+        oc_session_id = session_id.replace(":", "-")
         try:
             for attempt in range(2):
                 proc = await asyncio.create_subprocess_exec(
                     "openclaw", "agent",
-                    "--session-id", session_id,
-                    "--message", user_message,
+                    "--session-id", oc_session_id,
+                    "--message", task_text,
                     "--json", "--timeout", "120",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env={**os.environ, "PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}
                 )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=130)
+                # Renew the turn lease on every chunk of subprocess output
+                # (source D) so a genuinely-working long OpenClaw turn is not
+                # mistaken for a stall. Behaviourally identical to
+                # communicate() when the mailbox kernel is off.
+                stdout, stderr = await _communicate_touching_lease(proc, timeout=130)
                 output = stdout.decode().strip()
                 stderr_text = stderr.decode() if stderr else ""
 
                 if proc.returncode == 0 and output:
                     try:
                         data = json.loads(output)
-                        payloads = data.get("result", {}).get("payloads", [])
+                        result = data.get("result", {}) if isinstance(data, dict) else {}
+                        payloads = result.get("payloads", []) if isinstance(result, dict) else []
                         if payloads:
                             reply = payloads[0].get("text", "")
                         else:
-                            reply = str(data)
+                            # Payload-less envelope — the run aborted / hit the
+                            # per-turn timeout (status:timeout, aborted:true,
+                            # stopReason:toolUse) BEFORE emitting an assistant
+                            # payload. NEVER stringify the whole run-result object
+                            # into the user's chat: str(data) dumps
+                            # runId/meta/systemPromptReport/tools/executionTrace…
+                            # verbatim (the demo-critical raw-JSON-dump bug).
+                            # Surface only the clean assistant text the engine
+                            # already computed, or a clean status line.
+                            reply = _clean_reply_from_envelope(result, data)
                         # SSOT AgentTrace.steps: openclaw runs the tool loop
                         # itself, so its --json envelope can carry the full
-                        # transcript — thinking + tool_use + tool RESULT (the
-                        # field claude-code's SDK can't fill). The shared
-                        # TracingExecutor reads `_last_steps`; extraction is
-                        # fail-open + defensive across openclaw output shapes.
+                        # transcript: thinking + tool_use + tool RESULT. The
+                        # shared TracingExecutor reads `_last_steps`; extraction
+                        # is fail-open across openclaw output shapes.
                         try:
                             self._last_steps = _openclaw_steps(data)
                         except Exception:
@@ -987,15 +1740,9 @@ class OpenClawA2AExecutor(AgentExecutor):
 
         except asyncio.TimeoutError:
             reply = "OpenClaw timed out after 120s"
-        except Exception as e:
-            reply = f"OpenClaw error: {e}"
-        finally:
-            await set_current_task(self._heartbeat, "")
-
-        await event_queue.enqueue_event(new_text_message(reply))
-
-    async def cancel(self, context, event_queue):  # pragma: no cover
-        pass
+        # NOTE: any other exception propagates to the base execute(), which
+        # logs it and surfaces "OpenClaw error: <e>" as the reply.
+        return reply
 
 
 Adapter = OpenClawAdapter
