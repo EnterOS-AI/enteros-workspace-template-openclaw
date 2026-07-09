@@ -34,7 +34,7 @@ OPENCLAW_PROVIDERS = {
     "groq":       (("GROQ_API_KEY",),                       "https://api.groq.com/openai/v1"),
     "openrouter": (("OPENROUTER_API_KEY",),                 "https://openrouter.ai/api/v1"),
     "qianfan":    (("QIANFAN_API_KEY", "AISTUDIO_API_KEY"), "https://qianfan.baidubce.com/v2"),
-    "minimax":    (("MINIMAX_API_KEY",),                    "https://api.minimaxi.com/v1"),
+    "minimax":    (("MINIMAX_API_KEY",),                    "https://api.minimax.io/v1"),
     "moonshot":   (("KIMI_API_KEY",),                       "https://api.moonshot.ai/v1"),
 }
 
@@ -288,7 +288,11 @@ class OpenClawAdapter(BaseAdapter):
             # shapes like `moonshot:kimi-k2` / `kimi-coding/kimi-k2` that
             # the gateway rejects).
             compatibility = "openai"
-            if api_key and api_key.startswith("sk-cp-") and "minimaxi.com" in provider_url:
+            # Match the minimax vendor regardless of host (api.minimax.io global
+            # vs api.minimaxi.com China) — the default is now the global .io host,
+            # so keying on "minimaxi.com" would silently stop firing the sk-cp-
+            # anthropic rewrite. "minimax" matches both surfaces.
+            if api_key and api_key.startswith("sk-cp-") and "minimax" in provider_url:
                 logger.info(
                     "Detected sk-cp- claude-proxy token for native-Minimax route; "
                     "switching to Minimax Anthropic-compat endpoint "
@@ -732,11 +736,104 @@ class OpenClawAdapter(BaseAdapter):
         return OpenClawA2AExecutor(heartbeat=config.heartbeat)
 
 
+def _oc_text(content) -> str:
+    """Join the text of openclaw content blocks (``[{type:'text', text}]``)."""
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def _openclaw_steps(data: dict) -> list:
+    """Extract ordered turn steps (SSOT AgentTrace.steps shape — {kind:
+    'thinking'|'tool_call', text/name/input/result}) from openclaw's turn.
+
+    VERIFIED against a live workspace (openclaw 2026.x, MiniMax): the
+    ``agent --json`` envelope does NOT inline the transcript. Instead
+    ``result.meta.agentMeta.sessionFile`` points at a per-session JSONL that
+    this adapter — running in the SAME container — reads directly. Each line is
+    a typed event; the ``message`` events carry the ordered turn:
+
+      * ``role='assistant'`` → ``content[]`` blocks of ``{type:'text'|'thinking'
+        |'reasoning'}`` (reasoning / final answer) and ``{type:'toolCall', id,
+        name, arguments}``.
+      * ``role='toolResult'`` → ``toolCallId`` + ``content[].text`` /
+        ``details.aggregated`` (the tool RESULT — the field claude-code's SDK
+        cannot fill, so openclaw traces are strictly richer).
+
+    We splice each tool result back onto its call by ``toolCallId`` and emit
+    ``thinking`` / ``tool_call`` steps in transcript order. FAIL-OPEN and
+    defensive: a missing field, unreadable file, or any shape change yields
+    ``[]`` — the shared tracer still emits the turn output + prompt pieces.
+    """
+    try:
+        meta = (data.get("result") or {}).get("meta") or {}
+        sess = ((meta.get("agentMeta") or {}).get("sessionFile")) or ""
+        if not sess or not os.path.exists(sess):
+            return []
+        rows = []
+        with open(sess) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+        # Pass 1: index tool results by call id.
+        results = {}
+        for r in rows:
+            m = r.get("message") if isinstance(r, dict) else None
+            if isinstance(m, dict) and m.get("role") == "toolResult":
+                cid = m.get("toolCallId")
+                txt = _oc_text(m.get("content")) or (m.get("details") or {}).get("aggregated") or ""
+                if cid:
+                    results[cid] = txt
+        # Pass 2: ordered thinking + tool_call steps from assistant turns.
+        steps = []
+        for r in rows:
+            m = r.get("message") if isinstance(r, dict) else None
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            for blk in (m.get("content") or []):
+                if not isinstance(blk, dict):
+                    continue
+                bt = blk.get("type")
+                if bt == "toolCall":
+                    args = blk.get("arguments")
+                    steps.append({
+                        "kind": "tool_call",
+                        "name": str(blk.get("name") or "tool"),
+                        "input": json.dumps(args) if isinstance(args, (dict, list))
+                        else str(args or blk.get("partialArgs") or ""),
+                        "result": results.get(blk.get("id")) or None,
+                    })
+                elif bt in ("thinking", "reasoning"):
+                    t = blk.get("thinking") or blk.get("text") or blk.get("reasoning") or ""
+                    if t.strip():
+                        steps.append({"kind": "thinking", "text": t})
+                elif bt == "text":
+                    t = blk.get("text") or ""
+                    if t.strip():
+                        steps.append({"kind": "thinking", "text": t})
+        return steps
+    except Exception:
+        return []
+
+
 class OpenClawA2AExecutor(AgentExecutor):
     """Proxies A2A messages to OpenClaw via `openclaw agent` CLI subprocess."""
 
     def __init__(self, heartbeat=None):
         self._heartbeat = heartbeat
+        # Ordered turn steps (SSOT AgentTrace.steps) the shared TracingExecutor
+        # reads; populated per turn from openclaw's --json transcript.
+        self._last_steps = []
 
     async def execute(self, context, event_queue):
         from a2a.helpers import new_text_message
@@ -809,6 +906,16 @@ class OpenClawA2AExecutor(AgentExecutor):
                             reply = payloads[0].get("text", "")
                         else:
                             reply = str(data)
+                        # SSOT AgentTrace.steps: openclaw runs the tool loop
+                        # itself, so its --json envelope can carry the full
+                        # transcript — thinking + tool_use + tool RESULT (the
+                        # field claude-code's SDK can't fill). The shared
+                        # TracingExecutor reads `_last_steps`; extraction is
+                        # fail-open + defensive across openclaw output shapes.
+                        try:
+                            self._last_steps = _openclaw_steps(data)
+                        except Exception:
+                            self._last_steps = []
                     except json.JSONDecodeError:
                         reply = output
                     break
