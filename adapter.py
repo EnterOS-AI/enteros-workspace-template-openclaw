@@ -196,6 +196,82 @@ def _openclaw_mcp_present(config_path: str, name: str) -> bool:
     servers = mcp.get(OPENCLAW_MCP_SERVERS)
     return isinstance(servers, dict) and name in servers
 
+
+def _read_openclaw_mcp_servers(config_path: str) -> dict:
+    """Read the ``mcp.servers`` {name: spec} map from ~/.openclaw/openclaw.json.
+
+    The INVERSE of ``_render_openclaw_mcp`` (ADR-004 socket ``read_mcp_servers``):
+    it reuses the SAME native path + parser as ``_openclaw_mcp_present`` so a
+    server the renderer writes is byte-for-byte the one enumerate spawns. Moved
+    into the adapter (faithful copy of the runtime engine's
+    ``mcp_render._read_openclaw_mcp_servers``) so ``enumerate_loaded_mcp_tools``
+    round-trips openclaw's OWN native config without dispatching through the
+    engine's ``read_mcp_servers_for`` switch. Fail-closed: a missing / unreadable
+    / malformed / structurally-unexpected config yields ``{}`` (never crashes the
+    enumerate path)."""
+    data = _load_openclaw_config(config_path)
+    mcp = data.get(OPENCLAW_MCP_PARENT)
+    if not isinstance(mcp, dict):
+        return {}
+    servers = mcp.get(OPENCLAW_MCP_SERVERS)
+    return (
+        {k: v for k, v in servers.items() if isinstance(v, dict)}
+        if isinstance(servers, dict)
+        else {}
+    )
+
+
+# OpenClaw-native identity (persona) convention. OpenClaw's gateway reads identity
+# from SOUL.md in its workspace, populated by copying top-level ``/configs/*.md``
+# at setup — so writing ``/configs/SOUL.md`` makes the canonical persona the
+# model's actual identity, overlaying the baked placeholder SOUL.md. The baked
+# BOOTSTRAP.md / AGENTS.md placeholders are cleared (overwritten with a one-line
+# pointer) so their generic boilerplate can't compete with the strong materialized
+# identity. Mirrors the runtime engine's persona_render OPENCLAW_PERSONA_FILE /
+# OPENCLAW_CLEARED_FILES (ADR-004 socket ``materialize_persona``).
+OPENCLAW_PERSONA_FILE = "SOUL.md"
+OPENCLAW_CLEARED_FILES = ("BOOTSTRAP.md", "AGENTS.md")
+
+
+def _write_persona_file(target, persona: str) -> None:
+    """Write ``persona`` to ``target`` (parents created), trailing newline.
+
+    Faithful copy of persona_render._write_persona_file so the byte-shape of the
+    materialized SOUL.md is identical to the engine's."""
+    from pathlib import Path as _Path
+
+    target = _Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = persona if persona.endswith("\n") else persona + "\n"
+    target.write_text(body, encoding="utf-8")
+
+
+def _materialize_openclaw_persona(config_path, persona: str):
+    """OpenClaw — write ``persona`` to ``<configs>/SOUL.md`` and CLEAR the
+    ``BOOTSTRAP.md`` / ``AGENTS.md`` placeholders. Returns the SOUL.md path.
+
+    Byte-identical to the runtime engine's
+    ``persona_render.materialize_openclaw_persona`` (moved into the adapter per
+    ADR-004): writes the top-level ``/configs/SOUL.md`` so the canonical persona
+    becomes the model's actual identity overlaying the baked placeholder SOUL.md,
+    and overwrites the baked BOOTSTRAP.md / AGENTS.md with a neutral one-liner so
+    no competing identity boilerplate loads."""
+    from pathlib import Path as _Path
+
+    base = _Path(config_path)
+    target = base / OPENCLAW_PERSONA_FILE
+    _write_persona_file(target, persona)
+    for cleared in OPENCLAW_CLEARED_FILES:
+        stub = base / cleared
+        _write_persona_file(
+            stub,
+            f"# {cleared[:-3]}\n\n"
+            "(Cleared by persona materialization — this workspace's identity and "
+            "role are defined in SOUL.md; discover and delegate to peers via the "
+            "`molecule` MCP tools.)",
+        )
+    return target
+
 # This template's declared default model — mirrors config.yaml's `model:`
 # field. Two hard constraints (both required; routability alone is NOT
 # enough — that gap is the second root cause this default fixes):
@@ -1388,6 +1464,84 @@ class OpenClawAdapter(BaseAdapter):
         Fail-closed by construction (a missing/malformed config yields False), so
         a genuinely MCP-less concierge stays degraded at the gate."""
         return _openclaw_mcp_present(_openclaw_config_path(), MANAGEMENT_MCP_NAME)
+
+    def mcp_settings_path(self, config) -> str:
+        """Absolute native MCP-config file openclaw reads its servers from
+        (~/.openclaw/openclaw.json), owned by the adapter (ADR-004 socket
+        ``mcp_settings_path``).
+
+        Overrides the base — which dispatches to the runtime's
+        ``mcp_settings_path_for`` — for the SAME runtime-version reason
+        ``register_mcp_server_hook`` / ``management_mcp_present`` do: the adapter
+        owns the openclaw native surface directly so the path agrees with what the
+        renderer writes / the present-probe + reader read, on every pinned runtime.
+        ``config`` (config_path) is unused: openclaw resolves ``$HOME`` at call
+        time, mirroring ``_openclaw_config_path``."""
+        return _openclaw_config_path()
+
+    async def enumerate_loaded_mcp_tools(self, config) -> "list[str] | None":
+        """Enumerate the LOADED MCP tool ids openclaw actually has, or None
+        (ADR-004 socket ``enumerate_loaded_mcp_tools``).
+
+        Overrides the base default (which reads openclaw's servers via the
+        engine's ``read_mcp_servers_for`` switch) to read openclaw's OWN native
+        config directly (``_read_openclaw_mcp_servers``) and hand the resolved
+        ``{name: spec}`` map to the shared boot-safe probe engine
+        (``enumerate_from_specs_async``). This co-locates the reader with the
+        renderer/present-probe in the adapter (the render→read→present triangle is
+        internally consistent) and keeps enumerate working on runtime versions
+        whose engine reader could be a ``{}`` stub — the same runtime-version
+        rationale as the render override.
+
+        TRI-STATE + BOOT-SAFE + NEVER-RAISES are provided by
+        ``enumerate_from_specs_async``:
+          * ``None``  — nothing observable (no servers declared, or every probe
+            failed/stalled/unreadable). Producer left unset → grace window.
+          * ``[]``    — a server connected and advertised zero tools.
+          * ``[ids]`` — deduped/sorted ``mcp__<server>__<tool>`` ids."""
+        from molecule_runtime.loaded_mcp_tools_probe import (
+            enumerate_from_specs_async,
+        )
+
+        servers = _read_openclaw_mcp_servers(_openclaw_config_path())
+        return await enumerate_from_specs_async(servers)
+
+    def materialize_persona(self, config: AdapterConfig):
+        """Materialize the workspace's CANONICAL persona into openclaw's native
+        identity file ``<configs>/SOUL.md`` (ADR-004 socket ``materialize_persona``).
+
+        The persona-file PORT (distinct from ``_materialize_persona_into_soul``,
+        which assembles the FULL platform system prompt into the gateway WORKSPACE
+        dir at setup): this writes the raw canonical persona into the top-level
+        ``/configs/SOUL.md`` and clears the BOOTSTRAP.md / AGENTS.md placeholders,
+        byte-identical to the runtime engine's ``materialize_openclaw_persona``.
+        Overrides the base — which dispatches through
+        ``persona_render.materialize_persona_for`` — to own the openclaw
+        convention directly (ADR-004 relocates per-runtime shape into the adapter).
+
+        Best-effort, fail-SOFT (a persona is not a privileged capability): reads
+        the canonical persona runtime-agnostically from ``config.prompt_files``
+        (via the engine's generic ``read_canonical_persona`` helper, which carries
+        no runtime name and stays in the engine), returns ``None`` (no-op) when no
+        persona is delivered — never clobbering openclaw's baked default with an
+        empty identity — and returns the SOUL.md path on success."""
+        from molecule_runtime import persona_render
+
+        persona = persona_render.read_canonical_persona(
+            config.config_path, config.prompt_files
+        )
+        if not (persona or "").strip():
+            logger.info(
+                "materialize_persona: no canonical persona delivered for openclaw "
+                "— leaving the runtime's native default (baked SOUL.md) untouched"
+            )
+            return None
+        target = _materialize_openclaw_persona(config.config_path, persona)
+        logger.info(
+            "materialize_persona: wrote openclaw persona (%d chars) to %s",
+            len(persona), target,
+        )
+        return target
 
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
         # Pass the workspace identity so the shared base derives a STABLE,

@@ -247,7 +247,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: pip install -q pytest pytest-asyncio pyyaml python-multipart && pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
+      # molecule-ai-sdk (molecule_plugin) is the ADR-004 conformance-suite home
+      # (tests/test_conformance.py inherits AdapterConformance FROM the SDK), so
+      # it is a TEST-time dep alongside the runtime engine. Both live in the
+      # private registry; jsonschema is pulled because the SDK's [test] extra
+      # (adapter_conformance's transitive deps) expects it.
+      - run: pip install -q pytest pytest-asyncio pyyaml python-multipart jsonschema && pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime molecule-ai-sdk
       # Concierge MCP loaded+callable e2e (fail-before/pass-after) — the
       # strengthened guard for the mcpServers:NONE / declared-but-dead class of
       # regression the mocked test_openclaw_mgmt_mcp.py could not catch. The
