@@ -55,71 +55,6 @@ RUN set -eux; \
     usermod -aG docker agent; \
     id agent
 
-# --- Pre-bake the org-management MCP for DETERMINISTIC concierge warm-up (core#3082). ---
-# The kind=platform concierge's management MCP is delivered as a plugin
-# (molecule-ai-plugin-molecule-platform-mcp) whose settings-fragment launches
-#   npx --prefer-offline @molecule-ai/mcp-server@<ver>
-# On a FRESH concierge that npx would otherwise COLD-PULL the full ~100-dep tree
-# from the Cloudflare-fronted Gitea npm registry — a network fetch that races the
-# runtime readiness probe's per-server 20s handshake budget and, under CF-WAF
-# throttling / concurrent-npx contention, can blow past the readiness window
-# entirely (observed: a fresh concierge stuck 503 past 300s while a warm one
-# reached its tools in ~48s — the whole "flaky warm-up" is that ONE network pull).
-#
-# Baking the exact version + its dep tree into the AGENT user's npm caches at
-# BUILD time makes the runtime's `npx --prefer-offline` resolve ENTIRELY FROM
-# CACHE — ZERO network pull — so warm-up is fast + deterministic every time.
-# `--prefer-offline` (set in the plugin fragment) keeps the registry as a
-# SELF-HEALING fallback if the cache ever misses (older image, cache evicted).
-#
-# ORDERING (fix vs the #210 claude-code block): the `npm install` into $warm only
-# seeds the CONTENT cache (_cacache tarballs) — it does NOT create the npx run
-# cache (_npx). npx --offline resolves a package via _npx + the cached PACKUMENT;
-# with neither present it dies `ENOTCACHED: cache mode is only-if-cached but no
-# cached response is available`. If the seeding `npx --prefer-offline` runs while
-# cwd=$warm (node_modules still present) npx executes the LOCAL copy and never
-# builds an _npx entry, so a later --offline resolve fails. We therefore DISCARD
-# $warm FIRST, then run the seeding `npx --prefer-offline` from a clean cwd so it
-# actually creates the _npx entry + caches the packument — making the strict
-# --offline self-check (and the runtime --prefer-offline) resolve with zero
-# network. Verified deterministic (3/3 fresh HOMEs) in node:22.
-#
-# HYGIENE: we warm only the caches (throwaway install, then discard node_modules)
-# — the admin MCP is NOT globally installed and NOT on PATH here, so an ordinary
-# (non-concierge) workspace on this shared image gains only inert cached tarballs,
-# never an active admin tool surface (the tools require MOLECULE_MCP_MODE=management
-# + a CP-authenticated bearer, injected only into the concierge). Run as `agent` so
-# the cache lands in the SAME /home/agent/.npm the gosu-dropped runtime reads at boot.
-#
-# MCP_SERVER_VERSION MUST match the plugin fragment's pinned version
-# (molecule-ai-plugin-molecule-platform-mcp settings-fragment.json). A stale bake
-# does NOT merely forfeit determinism: when the plugin pins AHEAD of this baked
-# version the runtime's `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
-# MISSES the <BAKED>-only cache and COLD-PULLS <PIN>, which under CF-WAF
-# throttling hard-fails ETARGET -> the concierge FALSE-READYs on every bump
-# (#228). GUARD D (task #229) enforces this lockstep as a HARD CI gate
-# (scripts/lint-mcp-pin-lockstep.sh, wired into ci.yml) and the publish workflow
-# OVERRIDES this default with the SSOT-derived --build-arg MCP_SERVER_VERSION so
-# the pushed image is ALWAYS built with the plugin-pinned version. This default
-# is kept in lockstep for plain/local `docker build` (no --build-arg) and is
-# machine-checked against the plugin SSOT on every PR.
-ARG MCP_SERVER_VERSION=1.8.2
-USER agent
-RUN set -eux; \
-    mkdir -p /home/agent/.npm; \
-    printf '@molecule-ai:registry=https://git.moleculesai.app/api/packages/molecule-ai/npm/\n' > /home/agent/.npmrc; \
-    warm="$(mktemp -d)"; cd "$warm"; npm init -y >/dev/null 2>&1; \
-    npm install --no-audit --no-fund --loglevel=error "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}"; \
-    cd /; rm -rf "$warm"; \
-    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"prebake","version":"1"}}}' \
-      | MOLECULE_MCP_MODE=management timeout 60 npx -y --prefer-offline "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}" >/dev/null 2>&1 || true; \
-    printf '%s\n%s\n' \
-      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"verify","version":"1"}}}' \
-      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-      | MOLECULE_MCP_MODE=management timeout 60 npx -y --offline "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}" 2>/dev/null | grep -q provision_workspace \
-      || (echo "ERROR: pre-baked @molecule-ai/mcp-server@${MCP_SERVER_VERSION} did not resolve OFFLINE or provision_workspace missing — the concierge warm-up bake is broken" >&2 && exit 1)
-USER root
-
 WORKDIR /app
 
 # RUNTIME_VERSION is forwarded from molecule-ci's reusable publish
@@ -151,6 +86,23 @@ RUN pip install --no-cache-dir \
         --extra-index-url "${PIP_EXTRA_INDEX_URL}" \
         "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
+
+# --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
+# The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
+# in a HARD-deadline enumeration spawn at boot; without a warm cache it cold-pulls
+# -> ETARGET / CF-WAF throttle -> #1027 fail-close (launch-side of RCA #2970). The bake
+# LOGIC + the pinned version now live ONCE in the base runtime (molecule_runtime, pinned
+# to the SDK contract management_mcp_server block) — this template DELEGATES to the shared
+# helper instead of carrying its own bake + ARG + Guard-D lint (ADR-004: SDK contract ->
+# base-runtime default -> per-adapter override-if-needed; no per-template fork). The pin
+# lockstep is now enforced ONCE in the runtime (constants == contract), so the per-template
+# Guard-D gate is removed. openclaw ships node globally on PATH, so no
+# MOLECULE_PREBAKE_NODE_BIN override. The helper's build-time OFFLINE self-check fails the
+# image if the bake is broken.
+USER agent
+RUN bash "$(python3 -c 'import molecule_runtime, os; print(os.path.dirname(molecule_runtime.__file__))')/scripts/prebake-mgmt-mcp.sh"
+USER root
+
 
 COPY adapter.py .
 COPY __init__.py .
