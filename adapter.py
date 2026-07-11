@@ -50,6 +50,27 @@ try:
 except Exception:  # pragma: no cover - older runtime wheel without the mailbox kernel
     _turn_lease = None
 
+# SDK-owned tool-call display primitive (ADR-004). The engine's
+# ``emit_tool_call`` POSTs a single ``agent_log`` activity row per tool call
+# that molecule-core turns into the live progress line AND the persistent
+# ToolTraceChip (core#2636). Before ADR-004 only the claude-code template
+# emitted these rows, so openclaw's canvas showed a bare spinner with no
+# visible tool activity. openclaw runs its own tool loop inside the shelled-out
+# ``openclaw agent`` subprocess and the per-tool-call transcript is reconstructed
+# post-turn from the session JSONL (see ``_openclaw_steps``); this adapter
+# replays each parsed tool_call step into ``emit_tool_call`` at its tool site so
+# the chips render (post-turn, whole-transcript — acceptable for the persistent
+# ToolTraceChip; it is not a live-incremental progress line).
+#
+# GUARDED like turn_lease above: wheels predating ADR-004 do not ship
+# molecule_runtime.tool_trace, so a hard import would break every turn on an
+# older runtime. Import optionally; _emit_tool_call below no-ops when it is
+# absent so the adapter runs unchanged on old runtimes.
+try:
+    from molecule_runtime.tool_trace import emit_tool_call as _emit_tool_call
+except Exception:  # pragma: no cover - older runtime wheel without tool_trace (ADR-004)
+    _emit_tool_call = None
+
 
 def _lease_reset() -> None:
     """Arm the process-global turn lease at turn start. No-op when the runtime
@@ -63,6 +84,39 @@ def _lease_touch() -> None:
     runtime predates the mailbox kernel or no lease is installed."""
     if _turn_lease is not None:
         _turn_lease.touch_current()
+
+
+async def _emit_tool_steps(steps: list) -> None:
+    """Replay every ``tool_call`` step from a parsed openclaw turn into the
+    SDK-owned ``emit_tool_call`` primitive (ADR-004) so the canvas renders a
+    ToolTraceChip per tool call (core#2636).
+
+    ``steps`` is the ``_openclaw_steps(data)`` output — the ordered
+    SSOT ``AgentTrace.steps`` list of ``{kind, name/input/result | text}`` dicts.
+    We emit one activity row per ``kind == 'tool_call'`` step, passing ONLY the
+    tool name; the engine's ``summarize_tool`` supplies the generic ``🛠 name(…)``
+    summary. ``thinking`` steps are NOT tool calls and are skipped.
+
+    Best-effort and never raises: ``emit_tool_call`` itself swallows every
+    network/platform failure, and this wrapper additionally no-ops when the
+    runtime predates ADR-004 (``_emit_tool_call is None``) or on any local error,
+    so a telemetry hiccup can never abort the turn or lose the agent's reply.
+    Emission is post-turn (the whole transcript is parsed after the subprocess
+    exits), so chips render after the turn rather than live-incrementally — the
+    persistent ToolTraceChip is the goal, not a streaming progress line.
+    """
+    if _emit_tool_call is None or not steps:
+        return
+    for step in steps:
+        try:
+            if not isinstance(step, dict) or step.get("kind") != "tool_call":
+                continue
+            name = step.get("name")
+            if not name:
+                continue
+            await _emit_tool_call(name=str(name))
+        except Exception:  # noqa: BLE001 - telemetry MUST never break a turn
+            continue
 
 
 logger = logging.getLogger(__name__)
@@ -1823,6 +1877,14 @@ class OpenClawA2AExecutor(SubprocessA2AExecutor):
                             self._last_steps = _openclaw_steps(data)
                         except Exception:
                             self._last_steps = []
+                        # ADR-004 tool-call display: replay each parsed tool_call
+                        # step into the SDK-owned emit_tool_call primitive so the
+                        # canvas renders a ToolTraceChip per tool call. This is the
+                        # ONLY correct emit site — do NOT shell out a second time;
+                        # the transcript is already in hand from this run's --json
+                        # envelope. Best-effort (never raises); chips render
+                        # post-turn (whole-transcript), not live-incrementally.
+                        await _emit_tool_steps(self._last_steps)
                     except json.JSONDecodeError:
                         reply = output
                     break
