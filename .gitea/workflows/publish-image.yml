@@ -26,6 +26,9 @@ name: publish-image
 # an updated `.runtime-version` file to this repo's main branch, which trips
 # the `on: push: branches: [main]` trigger here.
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   push:
     branches: [main]
