@@ -59,33 +59,36 @@ WORKDIR /app
 
 # RUNTIME_VERSION is forwarded from molecule-ci's reusable publish
 # workflow as a docker build-arg. Cascade-triggered builds set it to
-# the exact runtime version PyPI just published. Including it as an
+# the exact runtime version the private registry just published. Including it as an
 # ARG changes the cache key for the pip install layer below — the
 # fix for the cascade cache trap that bit us 5x on 2026-04-27.
 ARG RUNTIME_VERSION=
 
-# Gitea PyPI registry is the PRIMARY internal index per RFC internal#596
-# (Gitea PyPI middleman; CTO GO'd 2026-05-19). Anonymous reads work because
-# `molecule-ai` is a public org — no auth needs to be wired into the build.
-# pypi.org is kept as best-effort fallback for transitive deps that are
-# only on PyPI (everything-except-our-runtime). This removes the vendor
-# SPOF that bit us 2026-05-19 (compounded PyPI abuse-block + Railway
-# outage; internal#593 + #595) and unblocks publishes of versions that
-# Gitea-only has (e.g. workspace-runtime 0.1.1013+ / 0.2.0+).
-ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
-ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
+# Acquire the private runtime from the Gitea package registry before resolving
+# its public dependencies. Keeping the private and public indexes in separate
+# pip commands prevents dependency-confusion candidates from entering the
+# runtime wheel lookup. Anonymous reads are supported for this public org.
+ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir \
-      --index-url "${PIP_INDEX_URL}" \
-      --extra-index-url "${PIP_EXTRA_INDEX_URL}" \
-      -r requirements.txt && \
-    if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --upgrade \
-        --index-url "${PIP_INDEX_URL}" \
-        --extra-index-url "${PIP_EXTRA_INDEX_URL}" \
-        "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi
+COPY scripts/prepare-runtime-requirements.py /usr/local/bin/prepare-runtime-requirements.py
+RUN set -eux; \
+    runtime_project="molecules-workspace-runtime"; \
+    rm -rf /tmp/molecule-runtime; \
+    mkdir -p /tmp/molecule-runtime; \
+    runtime_requirement="$(python3 /usr/local/bin/prepare-runtime-requirements.py \
+      requirements.txt /tmp/template-requirements.txt "${RUNTIME_VERSION}")"; \
+    case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac; \
+    pip download --isolated --only-binary=:all: --no-deps \
+      --index-url "$MOLECULE_RUNTIME_INDEX" \
+      --dest /tmp/molecule-runtime \
+      "${runtime_requirement}"; \
+    runtime_wheel_count="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl' | wc -l)"; \
+    test "${runtime_wheel_count}" -eq 1; \
+    runtime_wheel="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl')"; \
+    pip install --isolated --no-cache-dir \
+      "${runtime_wheel}" -r /tmp/template-requirements.txt; \
+    rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
 # The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
