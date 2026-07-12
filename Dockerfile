@@ -71,14 +71,12 @@ ARG RUNTIME_VERSION=
 ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 COPY requirements.txt .
+COPY scripts/prepare-runtime-requirements.py /usr/local/bin/prepare-runtime-requirements.py
 RUN set -eux; \
-    runtime_requirement="$(awk '/^[[:space:]]*molecules-workspace-runtime/ { sub(/#.*/, ""); gsub(/[[:space:]]/, ""); print; exit }' requirements.txt)"; \
-    test -n "${runtime_requirement}"; \
-    if [ -n "${RUNTIME_VERSION}" ]; then \
-      runtime_requirement="molecules-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi; \
     rm -rf /tmp/molecule-runtime; \
     mkdir -p /tmp/molecule-runtime; \
+    runtime_requirement="$(python3 /usr/local/bin/prepare-runtime-requirements.py \
+      requirements.txt /tmp/molecule-runtime/requirements-public.txt "${RUNTIME_VERSION}")"; \
     pip download --isolated --only-binary=:all: --no-deps \
       --index-url "$MOLECULE_RUNTIME_INDEX" \
       --dest /tmp/molecule-runtime \
@@ -86,7 +84,8 @@ RUN set -eux; \
     runtime_wheel_count="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl' | wc -l)"; \
     test "${runtime_wheel_count}" -eq 1; \
     runtime_wheel="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl')"; \
-    pip install --isolated --no-cache-dir "${runtime_wheel}" -r requirements.txt; \
+    pip install --isolated --no-cache-dir \
+      "${runtime_wheel}" -r /tmp/molecule-runtime/requirements-public.txt; \
     rm -rf /tmp/molecule-runtime
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
