@@ -12,14 +12,14 @@ This runbook covers cloning, installing dependencies, building the Docker image,
 ## 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-org/molecule-ai-workspace-template-openclaw.git
+git clone https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-openclaw.git
 cd molecule-ai-workspace-template-openclaw
 ```
 
 If working on a fork:
 
 ```bash
-git remote add upstream https://github.com/your-org/molecule-ai-workspace-template-openclaw.git
+git remote add upstream https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-openclaw.git
 ```
 
 ## 2. Install Dependencies
@@ -27,8 +27,10 @@ git remote add upstream https://github.com/your-org/molecule-ai-workspace-templa
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip packaging
+rm -rf .molecule-ci-canonical
+git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+python .molecule-ci-canonical/scripts/install_workspace_dependencies.py
 ```
 
 For linting and type checking:
@@ -120,7 +122,7 @@ pytest tests/integration/test_adapter.py -v
 
 | Symptom | Likely cause | Resolution |
 |---------|--------------|------------|
-| Agent appears to hang; no output | `requirements.txt` pins old `openclaw-runtime==0.9.3` | Override: `pip install openclaw-runtime==0.11.2` before build |
+| Runtime import fails after changing `requirements.txt` | Dependencies were installed without the canonical source-pinned helper | Recreate the virtual environment and rerun the dependency-install steps above |
 | No tool call history in platform UI | `OPENCLAW_FORWARD_CONTEXT` not set | Set `OPENCLAW_FORWARD_CONTEXT=1` before running container |
 | Doubled system prompt after reconnect | `handle_session_resume()` re-injects prompt unconditionally | Set `OPENCLAW_NO_RESUME_REINJECT=1` as interim workaround |
 | Skills from `config.yaml` not loaded | Direct assignment overwrites platform defaults instead of merging | Use `OPENCLAW_SKILL_LIST` env var instead of `config.yaml` skills block |

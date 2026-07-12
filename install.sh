@@ -35,8 +35,8 @@
 #
 # Tracked: this is template-local "system deps" workaround. The
 # durable fix is bumping the workspace AMI to ship Node 22 directly,
-# which would also benefit gemini-cli and any future Node-based
-# runtimes. Until then, this hook keeps openclaw provisioning green.
+# which would also benefit future Node-based runtimes. Until then,
+# this hook keeps openclaw provisioning green.
 
 set -euo pipefail
 
