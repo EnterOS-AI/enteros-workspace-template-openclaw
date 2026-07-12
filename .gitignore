@@ -19,5 +19,6 @@
 # Workspace auth tokens
 .auth-token
 .auth_token
+.molecule-ci-canonical/
 __pycache__/
 .pytest_cache/

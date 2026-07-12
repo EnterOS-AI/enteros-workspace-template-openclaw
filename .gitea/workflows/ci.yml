@@ -32,16 +32,6 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  # HERMETIC dep policy (CI-robustness): do NOT set PIP_INDEX_URL=private —
-  # it force-routes EVERY pip install (pytest, pyyaml, jsonschema, …) at the
-  # private index, which serves only molecules-workspace-runtime → 404s all
-  # public tooling (the Adapter-unit-tests / Template-validation reds). Public
-  # tooling resolves from the default (PyPI) index; the private runtime — which
-  # is ABSENT from public PyPI, so no dependency-confusion — is pulled via an
-  # EXPLICIT --extra-index-url on the runtime install only. The legacy name
-  # molecule-ai-workspace-runtime IS squatted on public PyPI (0.1.999999); we
-  # install the CURRENT dist name molecules-workspace-runtime (private-only).
-  MOLECULE_PRIVATE_INDEX: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 permissions:
   contents: read
@@ -71,7 +61,7 @@ jobs:
               re.compile(r'''ghp_[a-zA-Z0-9]{36,}'''),
               re.compile(r'''sk-ant-[a-zA-Z0-9]{50,}'''),
           ]
-          SKIP_DIRS = {'.molecule-ci', '.molecule-ci-canonical', '.git', 'node_modules', '__pycache__'}
+          SKIP_DIRS = {'.molecule-ci-canonical', '.git', 'node_modules', '__pycache__'}
           EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh'}
 
           def is_false_positive(line):
@@ -118,15 +108,23 @@ jobs:
     needs: validate-static
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Skip executable validation for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::runtime installation, imports, tests, and Docker builds are disabled for external forks"
       - name: Fetch molecule-ci canonical scripts
+        if: github.event.pull_request.head.repo.fork != true
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-      - run: pip install pyyaml -q
-      - if: hashFiles('requirements.txt') != ''
-        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
-      - if: hashFiles('requirements.txt') == ''
-        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
-      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: Install canonical validator dependencies
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 -m pip install --isolated --break-system-packages -q pyyaml jsonschema packaging
+      - name: Install source-pinned runtime and template dependencies
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing --break-system-packages
+      - name: Validate workspace-template contract (full)
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
       - name: Adapter platform-routing unit tests
+        if: github.event.pull_request.head.repo.fork != true
         # Scoped to the platform-routing test this PR adds. The rest of tests/
         # (test_model_fallback, test_session_id_derivation) is NOT wired to CI
         # yet and has pre-existing failures against the published runtime —
@@ -135,7 +133,7 @@ jobs:
           pip install -q pytest
           python3 -m pytest tests/test_platform_routing.py -q
       - name: Docker build smoke test
-        if: hashFiles('Dockerfile') != ''
+        if: github.event.pull_request.head.repo.fork != true
         run: |
           if ! docker info >/dev/null 2>&1; then
             echo "::warning::docker daemon unreachable — skipping Docker build smoke"
@@ -171,8 +169,12 @@ jobs:
     # Gitea 1.22.6 can leave the protected context pending instead of skipped.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Skip privileged conformance for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::privileged T4 validation is disabled for external forks"
       - name: Build the runtime image
         id: build
+        if: github.event.pull_request.head.repo.fork != true
         run: |
           if ! docker info >/dev/null 2>&1; then
             echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
@@ -181,6 +183,7 @@ jobs:
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND token agent-ownership
+        if: github.event.pull_request.head.repo.fork != true
         env:
           T4_PROBE_NAME: "t4probe-${{ github.run_id }}-${{ github.run_attempt }}"
           MOLECULE_T4_PROBE_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
@@ -247,12 +250,27 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Skip executable tests for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::dependency installation and repository tests are disabled for external forks"
+      - name: Fetch molecule-ci canonical scripts
+        if: github.event.pull_request.head.repo.fork != true
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       # molecule-ai-sdk (molecule_plugin) is the ADR-004 conformance-suite home
       # (tests/test_conformance.py inherits AdapterConformance FROM the SDK), so
-      # it is a TEST-time dep alongside the runtime engine. Both live in the
-      # private registry; jsonschema is pulled because the SDK's [test] extra
-      # (adapter_conformance's transitive deps) expects it.
-      - run: pip install -q pytest pytest-asyncio pyyaml python-multipart jsonschema && pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime molecule-ai-sdk
+      # it is a test-time dependency alongside the runtime engine. Public test
+      # tooling is resolved separately, the runtime comes only through the
+      # canonical private-source installer, and the SDK is content-addressed to
+      # the reviewed SSOT commit rather than selected from a package index.
+      - name: Install public test tooling
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 -m pip install --isolated --break-system-packages -q pytest pytest-asyncio pyyaml python-multipart jsonschema packaging
+      - name: Install source-pinned runtime and template dependencies
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing --break-system-packages
+      - name: Install SDK SSOT at reviewed commit
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 -m pip install --isolated --break-system-packages -q "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@c58c6697b2455540c515c9a3c6656a34ab286e66"
       # Concierge MCP loaded+callable e2e (fail-before/pass-after) — the
       # strengthened guard for the mcpServers:NONE / declared-but-dead class of
       # regression the mocked test_openclaw_mgmt_mcp.py could not catch. The
@@ -261,8 +279,12 @@ jobs:
       # advertised over the wire. The LIVE layer (docker exec into a real
       # concierge) auto-skips here and is driven by the deploy gate via
       # MOLECULE_LIVE_CONCIERGE_CONTAINER.
-      - run: python3 -m pytest tests/test_openclaw_concierge_mcp_live_e2e.py -v
-      - run: python3 -m pytest tests/ -v
+      - name: Concierge MCP end-to-end tests
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 -m pytest tests/test_openclaw_concierge_mcp_live_e2e.py -v
+      - name: Repository unit tests
+        if: github.event.pull_request.head.repo.fork != true
+        run: python3 -m pytest tests/ -v
 
   # GUARD D (per-template pin<->bake lockstep) REMOVED: the mcp-server bake is now
   # the base-runtime SSOT helper (molecule_runtime/scripts/prebake-mgmt-mcp.sh) and

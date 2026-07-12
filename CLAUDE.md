@@ -17,7 +17,7 @@ A Molecule AI workspace template for the **openclaw** single-agent runtime. It p
 
 ## Purpose
 
-`openclaw` is a lightweight single-agent runtime. Unlike deepagents (which runs an orchestrator plus multiple task agents), openclaw runs a single agent container that receives task assignments from the platform, executes them, and returns results. The template provides:
+`openclaw` is a lightweight single-agent runtime. It runs a single agent container that receives task assignments from the platform, executes them, and returns results. The template provides:
 
 - A `config.yaml` that specifies the agent's system configuration, model, and skill requirements
 - An `adapter.py` that bridges Molecule platform events to the openclaw agent and surfaces results
@@ -64,15 +64,18 @@ Skill files are not baked into the image — they are injected at runtime as a v
 
 ```bash
 # 1. Clone the template
-git clone https://github.com/your-org/molecule-ai-workspace-template-openclaw.git
+git clone https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-openclaw.git
 cd molecule-ai-workspace-template-openclaw
 
 # 2. Create a virtual environment
 python -m venv .venv
 source .venv/bin/activate    # Windows: .venv\Scripts\activate
 
-# 3. Install dependencies
-pip install -r requirements.txt
+# 3. Install the runtime from its private source and resolve public dependencies
+rm -rf .molecule-ci-canonical
+git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+python -m pip install --upgrade pip packaging
+python .molecule-ci-canonical/scripts/install_workspace_dependencies.py
 
 # 4. Set required env vars
 export MOLECULE_PLATFORM_URL=https://platform.molecule.ai

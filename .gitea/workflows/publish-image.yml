@@ -33,6 +33,7 @@ on:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  MOLECULE_PRIVATE_INDEX: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
   # CANONICAL content-addressed registry host (Cloudflare-fronted alias) -
   # used for the promoted PIN ref and the image labels (IMAGE_NAME@<digest>).
   IMAGE_NAME: registry.moleculesai.app/molecule-ai/workspace-template-openclaw
@@ -107,9 +108,17 @@ jobs:
           set -eu
           FALLBACK_MODULES='plugins|adapter_base|config|main|preflight|prompt|coordinator|consolidation|events|heartbeat|transcript_auth|runtime_wedge|watcher|skill_loader|policies|adapters|builtin_tools|executor_helpers|a2a_executor|a2a_client|a2a_tools|a2a_cli|a2a_mcp_server|agent|agents_md|initial_prompt|molecule_ai_status|platform_auth|shared_runtime'
           RUNTIME_MODULES=""
+          rm -rf /tmp/runtime-wheel
           mkdir -p /tmp/runtime-wheel
-          if pip download --quiet molecule-ai-workspace-runtime --no-deps -d /tmp/runtime-wheel 2>/dev/null; then
-            WHEEL=$(ls /tmp/runtime-wheel/*.whl 2>/dev/null | head -1)
+          if python3 -m pip download --quiet --isolated \
+            --disable-pip-version-check \
+            --only-binary=:all: \
+            --no-deps \
+            --index-url "$MOLECULE_PRIVATE_INDEX" \
+            --dest /tmp/runtime-wheel \
+            molecules-workspace-runtime 2>/dev/null; then
+            WHEEL=$(find /tmp/runtime-wheel -maxdepth 1 -type f \
+              -name 'molecules_workspace_runtime-*.whl' -print -quit)
             if [ -n "$WHEEL" ]; then
               RUNTIME_MODULES=$(unzip -p "$WHEEL" molecule_runtime/_runtime_modules.json 2>/dev/null \
                 | python3 -c "import sys,json; m=json.load(sys.stdin); print('|'.join(sorted(set(m['top_level_modules']) | set(m['subpackages']))))" 2>/dev/null || echo "")
