@@ -59,7 +59,7 @@ WORKDIR /app
 
 # RUNTIME_VERSION is forwarded from molecule-ci's reusable publish
 # workflow as a docker build-arg. Cascade-triggered builds set it to
-# the exact runtime version PyPI just published. Including it as an
+# the exact runtime version the private registry just published. Including it as an
 # ARG changes the cache key for the pip install layer below — the
 # fix for the cascade cache trap that bit us 5x on 2026-04-27.
 ARG RUNTIME_VERSION=

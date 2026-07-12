@@ -12,6 +12,7 @@ from pip._vendor.packaging.version import InvalidVersion, Version
 
 RUNTIME_DISTRIBUTION = "molecules-workspace-runtime"
 RUNTIME_CANONICAL_NAME = canonicalize_name(RUNTIME_DISTRIBUTION)
+RETIRED_RUNTIME_CANONICAL_NAME = canonicalize_name("molecule-ai-workspace-runtime")
 
 
 class RuntimeRequirementError(ValueError):
@@ -40,7 +41,10 @@ def _parse_runtime_candidate(line: str) -> Requirement | None:
     if requirement.url:
         raise RuntimeRequirementError("direct URL requirements are not allowed")
 
-    if canonicalize_name(requirement.name) != RUNTIME_CANONICAL_NAME:
+    requirement_name = canonicalize_name(requirement.name)
+    if requirement_name == RETIRED_RUNTIME_CANONICAL_NAME:
+        raise RuntimeRequirementError("retired runtime distribution is not allowed")
+    if requirement_name != RUNTIME_CANONICAL_NAME:
         return None
     if requirement.extras or requirement.marker:
         raise RuntimeRequirementError(

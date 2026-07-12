@@ -106,6 +106,20 @@ def test_runtime_requirement_is_canonicalized_and_filtered(tmp_path: Path) -> No
     assert filtered.read_text(encoding="utf-8") == "python-multipart>=0.0.27\n"
 
 
+def test_retired_runtime_distribution_is_rejected(tmp_path: Path) -> None:
+    result, filtered = _prepare_requirements(
+        tmp_path,
+        (
+            "molecules-workspace-runtime>=0.3.11\n"
+            "molecule-ai-workspace-runtime>=0.1\n"
+        ),
+    )
+
+    assert result.returncode != 0
+    assert "retired runtime distribution" in result.stderr
+    assert not filtered.exists()
+
+
 @pytest.mark.parametrize(
     "requirements",
     [
