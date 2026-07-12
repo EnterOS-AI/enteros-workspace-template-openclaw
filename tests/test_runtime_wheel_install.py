@@ -134,5 +134,5 @@ def test_local_runtime_wheel_and_requirements_share_one_isolated_solve() -> None
         "pip install --isolated", 1
     )[1].split(";", 1)[0]
     assert '"${runtime_wheel}"' in install_command
-    assert "-r /tmp/molecule-runtime/requirements-public.txt" in install_command
+    assert "-r /tmp/template-requirements.txt" in install_command
     assert dockerfile.count("pip install --isolated") == 1

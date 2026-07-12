@@ -73,10 +73,12 @@ ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/
 COPY requirements.txt .
 COPY scripts/prepare-runtime-requirements.py /usr/local/bin/prepare-runtime-requirements.py
 RUN set -eux; \
+    runtime_project="molecules-workspace-runtime"; \
     rm -rf /tmp/molecule-runtime; \
     mkdir -p /tmp/molecule-runtime; \
     runtime_requirement="$(python3 /usr/local/bin/prepare-runtime-requirements.py \
-      requirements.txt /tmp/molecule-runtime/requirements-public.txt "${RUNTIME_VERSION}")"; \
+      requirements.txt /tmp/template-requirements.txt "${RUNTIME_VERSION}")"; \
+    case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac; \
     pip download --isolated --only-binary=:all: --no-deps \
       --index-url "$MOLECULE_RUNTIME_INDEX" \
       --dest /tmp/molecule-runtime \
@@ -85,8 +87,8 @@ RUN set -eux; \
     test "${runtime_wheel_count}" -eq 1; \
     runtime_wheel="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl')"; \
     pip install --isolated --no-cache-dir \
-      "${runtime_wheel}" -r /tmp/molecule-runtime/requirements-public.txt; \
-    rm -rf /tmp/molecule-runtime
+      "${runtime_wheel}" -r /tmp/template-requirements.txt; \
+    rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
 # The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
