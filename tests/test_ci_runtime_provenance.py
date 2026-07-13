@@ -7,7 +7,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = REPO_ROOT / ".gitea" / "workflows" / "ci.yml"
 PUBLISH_WORKFLOW = REPO_ROOT / ".gitea" / "workflows" / "publish-image.yml"
-SDK_COMMIT = "3474157daca56e3de5b7" + "cffd2a2f84b78bf63b68"
+SDK_COMMIT = "da42c7f2dae122aaa6f3" + "4a74c13e598a87870586"
 RUNTIME_INSTALLER = (
     ".molecule-ci-canonical/scripts/install_workspace_dependencies.py "
     "--allow-missing --break-system-packages"
