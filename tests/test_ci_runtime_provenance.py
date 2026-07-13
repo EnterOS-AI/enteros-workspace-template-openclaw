@@ -7,7 +7,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = REPO_ROOT / ".gitea" / "workflows" / "ci.yml"
 PUBLISH_WORKFLOW = REPO_ROOT / ".gitea" / "workflows" / "publish-image.yml"
-SDK_COMMIT = "c58c6697b2455540c51" + "5c9a3c6656a34ab286e66"
+SDK_COMMIT = "da42c7f2dae122aaa6f3" + "4a74c13e598a87870586"
 RUNTIME_INSTALLER = (
     ".molecule-ci-canonical/scripts/install_workspace_dependencies.py "
     "--allow-missing --break-system-packages"
@@ -92,3 +92,17 @@ def test_retired_runtime_project_is_absent_from_active_ci_and_guidance() -> None
 
 def test_obsolete_vendored_validator_is_deleted() -> None:
     assert not (REPO_ROOT / ".molecule-ci").exists()
+
+
+def test_static_ci_rejects_legacy_declared_plugin_installer() -> None:
+    jobs = load_ci_workflow()["jobs"]
+    guard = next(
+        step
+        for step in jobs["validate-static"]["steps"]
+        if step.get("name") == "Reject legacy declared-plugin installer"
+    )
+
+    command = guard["run"]
+    assert "entrypoint.sh" in command
+    assert ".runtime-version" in command
+    assert "0.4.0" in command
