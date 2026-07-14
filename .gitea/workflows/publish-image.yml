@@ -3,18 +3,14 @@ name: publish-image
 # Builds the openclaw workspace template Dockerfile and pushes it to the Gitea registry (registry.moleculesai.app) as
 # `<REGISTRY>/workspace-template-openclaw:latest` + `:sha-<7>`.
 #
-# Ported/inlined from molecule-ci's publish-template-image.yml reusable
-# workflow. Cross-repo `uses:` is BLOCKED on Gitea 1.22.6 because
-# DEFAULT_ACTIONS_URL=github causes the runner to attempt the lookup against
-# github.com, which always 404s even for same-instance repos.
-# (feedback_gitea_cross_repo_uses_blocked)
+# The publish flow remains repository-local because its co-located registry
+# endpoint, smoke gate, and pin promotion are template-specific.
 #
-# Registry: production uses ECR (MOLECULE_IMAGE_REGISTRY env var on EC2 /
-# Railway) backed by org-level AWS creds. The ECR repo
-# `molecule-ai/workspace-template-openclaw` must exist (created by migration
-# sweep or on first push via "Ensure ECR repository exists" step).
+# Images publish to the Gitea OCI backend. The canonical pull host is
+# registry.moleculesai.app; the co-located runner pushes through
+# localhost:3200 to bypass Cloudflare's request-body limit for large layers.
 #
-# Gitea 1.22.6 hostile-shape checklist applied:
+# Workflow compatibility choices:
 #   - No workflow_dispatch.inputs
 #   - No merge_group trigger
 #   - No cross-repo uses:
@@ -138,8 +134,7 @@ jobs:
           echo "::notice::no bare imports of runtime modules in *.py files"
 
       - name: Log in to our container registry (Gitea OCI - CF-bypass local push endpoint)
-        # ECR retired (operator directive: use our own registry). Push to the
-        # Gitea-backed OCI registry at registry.moleculesai.app. The push
+        # Push to the Gitea-backed OCI registry at registry.moleculesai.app. The push
         # credential is the Gitea package-publisher, fetched from the Infisical
         # SSOT via the CI bootstrap trio (INFISICAL_CI_*) — never hardcoded.
         # FORK SAFETY: this workflow has no pull_request trigger (push:[main] +
@@ -257,13 +252,13 @@ jobs:
     # runtime_image_pins via the control-plane admin endpoint, so existing
     # tenants actually pick up the new image instead of staying pinned to the
     # old digest. Without this job the publish job builds + pushes :latest/:sha
-    # to ECR but the prod (and staging) runtime_image_pins never move — the
+    # to Gitea OCI but the prod (and staging) runtime_image_pins never move — the
     # silent-stale-pin gap this PR closes. Mirrors the claude-code / codex /
     # hermes sibling templates which already promote.
     #
-    # Gitea has no reliable `workflow_run`, so promotion is a job in THIS same
-    # workflow (not a separate workflow listening on publish success). Gated on
-    # `if: success() && github.ref == 'refs/heads/main'` so a failed publish
+    # Promotion stays in this workflow so it consumes the exact published
+    # digest across the `needs:` edge. Gated on `if: success() &&
+    # github.ref == 'refs/heads/main'` so a failed publish
     # (smoke red / push red) or a non-main run never bumps any pin — promotion
     # only ever runs AFTER a green build/push on main.
     #

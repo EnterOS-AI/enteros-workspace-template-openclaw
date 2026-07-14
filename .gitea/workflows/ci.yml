@@ -1,11 +1,10 @@
 name: CI
 
-# Ported from .github/workflows/ci.yml per feedback_gitea_cross_repo_uses_blocked.
-# The original `uses: Molecule-AI/molecule-ci/.github/...` reference hits the
-# suspended GitHub org (2026-05-06) and fails in 1s. Inlined here per the
-# hermes migration pattern (molecule-ai-workspace-template-hermes).
+# Repository-local validation pipeline. It clones the canonical validator
+# from molecule-ci on each run, while keeping this repository's protected
+# context names and runner requirements explicit.
 #
-# Gitea 1.22.6 hostile-shape checklist applied:
+# Workflow compatibility choices:
 #   - No workflow_dispatch.inputs
 #   - No merge_group trigger
 #   - No cross-repo uses:
@@ -151,7 +150,7 @@ jobs:
   # pc2-safe: false — needs docker for Docker build smoke; routes to docker-host only
   # (task #390 B-lite — PC2 native runners advertise `ubuntu-latest` but cannot
   # docker due to npipe→Linux-container bridging gap; AND-match on both labels
-  # excludes them while keeping the Linux operator-host runners eligible.)
+  # excludes them while keeping the Linux docker-host runners eligible.)
   validate-runtime:
     name: Template validation (runtime)
     runs-on: [ubuntu-latest, docker-host]
@@ -176,10 +175,8 @@ jobs:
         run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
       - name: Adapter platform-routing unit tests
         if: github.event.pull_request.head.repo.fork != true
-        # Scoped to the platform-routing test this PR adds. The rest of tests/
-        # (test_model_fallback, test_session_id_derivation) is NOT wired to CI
-        # yet and has pre-existing failures against the published runtime —
-        # fixing/enabling those is a separate cleanup, out of scope here.
+        # Targeted early feedback for platform routing. The repository-tests
+        # job below installs the full test dependencies and runs all of tests/.
         run: |
           pip install -q pytest
           python3 -m pytest tests/test_platform_routing.py -q
@@ -216,8 +213,8 @@ jobs:
     runs-on: [ubuntu-latest, docker-host]
     timeout-minutes: 15
     needs: validate-static
-    # Runs after static validation. Avoid job-level if: guards here because
-    # Gitea 1.22.6 can leave the protected context pending instead of skipped.
+    # Runs after static validation. Avoid job-level if: guards here so the
+    # protected context always reaches a terminal state.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Skip privileged conformance for external forks
