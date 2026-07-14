@@ -19,8 +19,11 @@ Molecule runtime integration, not an `openclaw-runtime` package.
 
 The supported direct providers and credentials are defined by
 `OPENCLAW_PROVIDERS` in `adapter.py` and the template `config.yaml`. Platform
-routes use the injected resolved provider/base URL/usage token. Setup fails
-before gateway start when the selected model cannot be served.
+routes use the injected resolved provider/base URL/usage token. A selected model
+with an unknown provider prefix logs a warning and falls back to
+`OPENCLAW_DEFAULT_MODEL`. Setup validates the effective route and fails before
+gateway start when that route lacks its accepted credential or required platform
+base URL and usage token.
 
 ## Session continuity
 

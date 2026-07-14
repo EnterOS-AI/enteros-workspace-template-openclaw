@@ -39,3 +39,11 @@ def test_active_documentation_has_no_retired_operational_guidance():
 
 def test_retired_ecr_lifecycle_helper_is_absent():
     assert not (ROOT / "scripts" / "ensure-ecr-lifecycle.sh").exists()
+
+
+def test_provider_support_note_matches_unknown_prefix_fallback():
+    support_notes = (ROOT / "known-issues.md").read_text(encoding="utf-8")
+    support_notes = re.sub(r"\s+", " ", support_notes)
+
+    assert "falls back to `OPENCLAW_DEFAULT_MODEL`" in support_notes
+    assert "effective route" in support_notes
