@@ -49,9 +49,9 @@ through workspace/platform secret surfaces.
 
 See [`runbooks/local-dev-setup.md`](runbooks/local-dev-setup.md) for the commands
 that mirror CI. Pull requests run static, unit, image, and conformance checks. A
-push to `main` invokes `publish-image`, which builds in the Gitea OCI registry
-and runs the configured pin verification. Do not substitute a manual registry
-script or direct-main-push procedure.
+push to `main` invokes `publish-image`, which builds the image, pushes it to the
+Gitea OCI registry, and runs the configured pin verification. Do not substitute
+a manual registry script or direct-main-push procedure.
 
 The current config contains `template_schema_version: 1`; change it only with a
 corresponding platform contract change and validation.
