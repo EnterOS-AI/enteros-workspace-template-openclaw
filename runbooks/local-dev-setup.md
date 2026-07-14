@@ -1,149 +1,73 @@
-# Local Development Setup — openclaw
+# Local development — OpenClaw workspace template
 
-This runbook covers cloning, installing dependencies, building the Docker image, and resolving common local development issues for the openclaw workspace template.
+These commands follow the current repository CI. Local tests do not require a
+live workspace or production credential.
 
 ## Prerequisites
 
 - Python 3.11+
-- Docker 24.0+
-- `git`
-- A Molecule platform account with API key, workspace ID, and a task ID for testing
+- Git
+- Access to `git.moleculesai.app` and its package registry
+- Docker only when reproducing the image/conformance jobs
 
-## 1. Clone the Repository
+## Clone and install test dependencies
 
 ```bash
 git clone https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-openclaw.git
 cd molecule-ai-workspace-template-openclaw
-```
+git switch -c fix/describe-the-change
 
-If working on a fork:
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install pytest pytest-asyncio pyyaml python-multipart jsonschema packaging
 
-```bash
-git remote add upstream https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-openclaw.git
-```
-
-## 2. Install Dependencies
-
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-python -m pip install --upgrade pip packaging
 rm -rf .molecule-ci-canonical
 git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-python .molecule-ci-canonical/scripts/install_workspace_dependencies.py
+python3 .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing
+python3 -m pip install "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@da42c7f2dae122aaa6f34a74c13e598a87870586"
 ```
 
-For linting and type checking:
+The canonical installer acquires the private runtime from the Gitea package
+registry. Do not select it from an untrusted public source.
+
+## Run the checks
 
 ```bash
-pip install ruff mypy pytest
+PROVIDERS_MANIFEST_FILE=internal/providers/providers.yaml \
+  python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+python3 -m pytest tests/test_platform_routing.py -q
+python3 -m pytest tests/test_openclaw_concierge_mcp_live_e2e.py -v
+python3 -m pytest tests/ -v
 ```
 
-## 3. Docker Build
+The last suite includes provider routing, session-id, persona, plugin, MCP,
+provenance, and documentation contracts. The live-concierge layer skips unless
+CI explicitly supplies a live container; its local logic layer still runs.
 
-Build the image locally and verify the entrypoint is set correctly:
+## Build the image
+
+With Docker and package access available:
 
 ```bash
-docker build -t openclaw-local:latest .
-docker run --rm openclaw-local:latest --version
-# Expected: prints the version from __init__.py
+docker build -t workspace-template-openclaw:dev .
 ```
 
-Always rebuild without cache when syncing from upstream to avoid stale layers:
+Do not use `python -m adapter` as a standalone runtime. The supported image
+entrypoint expects `/configs` and `/workspace`, executes `molecule-runtime`, and
+lets `OpenClawAdapter.setup()` start the gateway. CI owns the platform-shaped
+smoke and privilege-conformance checks.
+
+There is no `openclaw_smoke_test`, `mock_platform_server`, `tests/unit`, or
+`tests/integration` module in the current tree. Use the commands above rather
+than copying old examples.
+
+## Before opening a pull request
 
 ```bash
-docker build --no-cache -t openclaw-local:latest .
+git diff --check
+python3 -m pytest tests/test_current_documentation.py -q
 ```
 
-## 4. Configure Environment for Development
-
-Create a `.env` file in the repo root (never commit this file):
-
-```
-MOLECULE_PLATFORM_URL=https://platform.molecule.ai
-MOLECULE_WORKSPACE_ID=ws-dev-local
-MOLECULE_API_KEY=your-dev-key-here
-MOLECULE_TASK_ID=task-local-dev-001
-OPENCLAW_MODEL=claude-sonnet-4-20250514
-OPENCLAW_TIMEOUT_SEC=60
-OPENCLAW_TEMPERATURE=0.7
-OPENCLAW_MAX_TOKENS=4096
-MOLECULE_SKILLS_DIR=/workspace/skills
-OPENCLAW_SKILL_LIST=code-review,security-scan
-OPENCLAW_FORWARD_CONTEXT=1
-OPENCLAW_NO_RESUME_REINJECT=1
-```
-
-Override environment variables at runtime without editing the file:
-
-```bash
-docker run --rm \
-  --env-file .env \
-  -e OPENCLAW_TIMEOUT_SEC=30 \
-  -v "$(pwd)/skills:/workspace/skills:ro" \
-  openclaw-local:latest python -m adapter
-```
-
-### Dev-only Overrides
-
-| Variable | Dev default | Production default | Purpose |
-|----------|-------------|-------------------|---------|
-| `OPENCLAW_TIMEOUT_SEC` | `60` | `300` | Shorter timeout for faster dev loops |
-| `OPENCLAW_TEMPERATURE` | `0.7` | `0.3` | More random output for exploratory testing |
-| `OPENCLAW_FORWARD_CONTEXT` | `1` | `0` | Useful in dev to inspect full context |
-| `OPENCLAW_NO_RESUME_REINJECT` | `1` | `0` | Prevents double system-prompt injection during session resume testing |
-
-## 5. Run the Smoke Test
-
-The smoke test runs without a platform connection:
-
-```bash
-source .venv/bin/activate
-python -m openclaw_smoke_test
-# Exit code 0 = pass
-```
-
-To test against a mock platform server:
-
-```bash
-# Start mock server
-python -m mock_platform_server &
-MOCK_PORT=$!
-
-# Run adapter integration test
-export MOLECULE_PLATFORM_URL=http://localhost:${MOCK_PORT}
-export MOLECULE_WORKSPACE_ID=ws-test
-export MOLECULE_API_KEY=test-key
-export MOLECULE_TASK_ID=task-test-001
-pytest tests/integration/test_adapter.py -v
-```
-
-## 6. Common Issues
-
-| Symptom | Likely cause | Resolution |
-|---------|--------------|------------|
-| Runtime import fails after changing `requirements.txt` | Dependencies were installed without the canonical source-pinned helper | Recreate the virtual environment and rerun the dependency-install steps above |
-| No tool call history in platform UI | `OPENCLAW_FORWARD_CONTEXT` not set | Set `OPENCLAW_FORWARD_CONTEXT=1` before running container |
-| Doubled system prompt after reconnect | `handle_session_resume()` re-injects prompt unconditionally | Set `OPENCLAW_NO_RESUME_REINJECT=1` as interim workaround |
-| Skills from `config.yaml` not loaded | Direct assignment overwrites platform defaults instead of merging | Use `OPENCLAW_SKILL_LIST` env var instead of `config.yaml` skills block |
-| `docker build` fails with `pip install` error | Python version older than 3.11 or pip not upgraded | Use Python 3.11+; run `pip install --upgrade pip` first |
-| Skills directory not found at runtime | Volume not mounted; `MOLECULE_SKILLS_DIR` points to empty path | Mount: `-v "$(pwd)/skills:/workspace/skills:ro"` |
-| Session resume produces confused output | `system-prompt.md` injected twice on resume | See known-issues.md Issue 3; set `OPENCLAW_NO_RESUME_REINJECT=1` |
-| Adapter callback returns empty metadata | Context field not forwarded in `build_callback_payload()` | Set `OPENCLAW_FORWARD_CONTEXT=1` or patch `adapter.py` to serialize context |
-
-## 7. Hot-Reloading Skills
-
-Skill prompt files are loaded from `MOLECULE_SKILLS_DIR` at runtime and do not require a container restart. To update a skill:
-
-```bash
-# Edit skill file
-vim skills/code-review.md
-
-# No restart needed — adapter reloads on next task
-```
-
-For immediate reload during development, send `SIGHUP`:
-
-```bash
-docker kill --signal HUP <container_id>
-```
+Never commit `.env` files, provider keys, platform tokens, OpenClaw auth
+profiles, or generated credential files.

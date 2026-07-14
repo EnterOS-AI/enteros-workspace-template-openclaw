@@ -1,6 +1,6 @@
 # SOUL
 
-You are an AI agent running in an Molecule AI workspace. Define your identity and purpose here.
+You are an AI agent running in a Molecule AI workspace. Define your identity and purpose here.
 
 ## Core Identity
 
