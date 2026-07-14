@@ -43,6 +43,7 @@ RETIRED_RUNTIME_GUIDANCE = {
     r"Gitea 1\.22": "the retired Gitea server-version guidance",
     r"PyPI (publish|abuse)": "the retired public-PyPI release blocker",
     r"installed via npm at startup": "the incorrect OpenClaw install phase",
+    r"molecule-ci's reusable publish": "the old reusable-publish description",
 }
 
 

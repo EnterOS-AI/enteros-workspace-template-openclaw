@@ -57,7 +57,7 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# RUNTIME_VERSION is forwarded from molecule-ci's reusable publish
+# RUNTIME_VERSION is forwarded from this repository's publish-image
 # workflow as a docker build-arg. Cascade-triggered builds set it to
 # the exact runtime version the private registry just published. Including it as an
 # ARG changes the cache key for the pip install layer below — the
