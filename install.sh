@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# install.sh — host-install hook for the openclaw runtime.
+# install.sh — legacy self-managed host-install hook for the openclaw runtime.
+#
+# Hosted workspaces use the published image and entrypoint.sh. This hook is
+# retained for self-managed bare-host installations that explicitly invoke it.
 #
 # Why this exists
 # ---------------
 # openclaw's npm package (openclaw@2026.4.29 at time of writing) pins
-# `engines.node >= 22.14.0`. The default Ubuntu 24.04 workspace AMI
-# ships Node 18.19.1 from apt. When adapter.py:setup() runs
+# `engines.node >= 22.14.0`. Older host images shipped Node 18.19.1
+# from apt. When adapter.py:setup() ran
 # `npm install --prefix ~/.local -g openclaw` against Node 18, npm
 # either fails outright or surfaces a successful install whose
 # postinstall scripts crash on first invocation — both end as
@@ -13,8 +16,7 @@
 # molecule-runtime never binds port 8000, and the workspace flips to
 # status=failed within ~2 minutes of provision.
 #
-# Diagnosed 2026-05-01 from /var/log/molecule-runtime.log on a failed
-# provision:
+# Diagnosed 2026-05-01 from the legacy host runtime logs:
 #
 #     RuntimeError: Failed to install OpenClaw: npm WARN EBADENGINE
 #       package: 'openclaw@2026.4.29',

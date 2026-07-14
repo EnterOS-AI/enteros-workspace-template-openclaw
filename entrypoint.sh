@@ -34,9 +34,8 @@ fi
 # gate asserts both on a live container (host-root reach AND
 # /configs/.auth_token owner_uid==1000) and fails closed.
 #
-# Pattern matches template-claude-code/entrypoint.sh (the proven T4
-# reference, ECR sha256:e1ae9795… / git bbc2dae): fix volume ownership
-# as root, then re-exec via gosu as agent (uid 1000).
+# Pattern matches the live-verified template-claude-code T4 contract:
+# fix volume ownership as root, then re-exec via gosu as agent (uid 1000).
 
 # Boot-context snapshot — emitted on EVERY container start, including
 # every restart of a crash-loop. Logs NAMES of auth-relevant env vars,

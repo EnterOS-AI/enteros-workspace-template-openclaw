@@ -13,8 +13,8 @@ FROM python:3.11-slim
 #   /host (--privileged grants caps to root, not uid-1000) and cannot
 #   use the root:docker 0660 docker.sock — T4 would be
 #   provisioner-shape-only (the documented ABSENT-escalation-leg gap).
-#   Mirrors template-claude-code (proven, live-verified — ECR
-#   sha256:e1ae9795… / git bbc2dae). The sudoers drop-in + docker-group
+#   Mirrors the live-verified template-claude-code T4 contract. The
+#   sudoers drop-in + docker-group
 #   add are below, after useradd. ADDITIVE: does NOT change the agent
 #   uid and does NOT change /configs token ownership (still agent-owned,
 #   enforced by entrypoint.sh + the t4-conformance gate).
@@ -57,7 +57,7 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# RUNTIME_VERSION is forwarded from molecule-ci's reusable publish
+# RUNTIME_VERSION is forwarded from this repository's publish-image
 # workflow as a docker build-arg. Cascade-triggered builds set it to
 # the exact runtime version the private registry just published. Including it as an
 # ARG changes the cache key for the pip install layer below — the
