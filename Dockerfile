@@ -108,6 +108,22 @@ USER agent
 RUN bash "$(python3 -c 'import molecule_runtime, os; print(os.path.dirname(molecule_runtime.__file__))')/scripts/prebake-mgmt-mcp.sh"
 USER root
 
+# Make the pre-baked mgmt-MCP npm cache + scoped-registry config HOME-INDEPENDENT.
+# Per contracts/mcp-plugin-delivery.contract.json `home_independent`: the
+# kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server`
+# under a HOME that is NOT guaranteed to be the agent home (observed HOME=/root in
+# the provisioner), so a per-user ${HOME}/.npmrc / ${HOME}/.npm is MISSED — npx
+# then falls through to the PUBLIC registry -> ETARGET on the private @molecule-ai
+# scope -> #1027 "management MCP FAILED TO LAUNCH" fail-close, EVEN THOUGH the
+# version is correctly baked. Reproduced: openclaw peer-visibility boot is ~6x
+# slower than hermes and flaps to `failed` under concurrent CF-WAF throttle;
+# hermes is unaffected because its runtime propagates the launch env. The prebake
+# helper can't `npm config set --global` (EACCES as the non-root agent), so pin
+# the two launch vars as container ENV instead — inherited by the mgmt-MCP spawn
+# regardless of HOME, pointing npx at the baked cache + scoped-registry npmrc.
+ENV npm_config_cache=/home/agent/.npm \
+    NPM_CONFIG_USERCONFIG=/home/agent/.npmrc
+
 
 COPY adapter.py .
 COPY __init__.py .
