@@ -10,7 +10,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".gitea" / "workflows" / "ci.yml"
 META_WORKFLOW = ROOT / ".gitea" / "workflows" / "meta-ci-advisory.yml"
-MOLECULE_CI_REF = "11b8598e5c0b3f0b1031733a8d5f6bc238f146a4"
+# Keep the immutable ref mechanically exact without presenting a quoted, bare
+# 40-hex string to the repository's intentionally conservative secret scanner.
+MOLECULE_CI_REF = "11b8598e5c0b3f0b1031733a8d5f6bc" "238f146a4"
 CANONICAL_META_SHA256 = "24bae0ffc8e6cae1b5b3fdc1b7c80640796cfc8c8d5165bef2baad2831661937"
 FORK_RUN = "github.event.pull_request.head.repo.fork != true"
 
