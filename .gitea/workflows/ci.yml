@@ -42,6 +42,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       - name: Check for secrets
@@ -178,6 +180,8 @@ jobs:
     needs: validate-static
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Skip executable validation for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::runtime installation, imports, tests, and Docker builds are disabled for external forks"
@@ -256,6 +260,8 @@ jobs:
     # protected context always reaches a terminal state.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Skip privileged conformance for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::privileged T4 validation is disabled for external forks"
@@ -274,6 +280,13 @@ jobs:
           fi
           EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          KEEP_T4_IMAGE=0
+          cleanup_t4_build() {
+            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
+              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_t4_build EXIT
           docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
           ACTUAL_RUNTIME_VERSION="$(
             docker run --rm --entrypoint python3 "$T4_TAG" \
@@ -283,6 +296,7 @@ jobs:
             echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
             exit 1
           fi
+          KEEP_T4_IMAGE=1
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND token agent-ownership
         if: github.event.pull_request.head.repo.fork != true
         env:
@@ -297,8 +311,9 @@ jobs:
           # wants a live workspace; we only need the container up long
           # enough to probe, so override the command with a sleep and
           # exercise the agent context directly.
+          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
           docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true
-          CID=$(docker run -d \
+          docker run -d \
             --name "$T4_PROBE" \
             --network host \
             --privileged \
@@ -306,8 +321,7 @@ jobs:
             -v /:/host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --entrypoint /bin/sh \
-            "$T4_TAG" -c 'sleep 600')
-          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
+            "$T4_TAG" -c 'sleep 600' >/dev/null
 
           echo "=== Reproduce the agent-owned-token half of the entrypoint contract ==="
           # The real entrypoint chowns /configs to agent before gosu;
@@ -351,6 +365,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Skip executable tests for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::dependency installation and repository tests are disabled for external forks"
