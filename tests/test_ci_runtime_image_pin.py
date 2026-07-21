@@ -71,7 +71,10 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
     )
 
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
-        "docker build"
+        "docker info"
+    )
+    assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
+        "immutable management-MCP attestation is missing"
     )
     cleanup_body = build_script[
         build_script.index("cleanup_t4_build() {") : build_script.index(
@@ -79,6 +82,11 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
         )
     ]
     assert 'docker rm -f "$MCP_VERIFY_CONTAINER"' in cleanup_body
+    assert 'rm -rf -- "$MOLECULE_CI_ROOT"' in cleanup_body
+    assert (
+        'rm -f -- "$MCP_ATTESTATION" "$RUNTIME_VERSION_FILE" "$MCP_VERIFY_LOG"'
+        in cleanup_body
+    )
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
         "docker create --interactive --name"
     )
@@ -86,7 +94,7 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
         'docker start --attach --interactive "$MCP_VERIFY_CONTAINER"'
     ) < build_script.index('docker rm "$MCP_VERIFY_CONTAINER" >/dev/null')
     assert build_script.index("KEEP_T4_IMAGE=1") > build_script.index(
-        '"$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION"'
+        "mcp-built-image-e2e:sentinel:executed"
     )
     assert probe_script.index("trap '") < probe_script.index("docker run -d")
 
@@ -118,6 +126,9 @@ def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> No
     assert prepare_step["if"] == FORK_RUN
     assert build_step["if"] == FORK_RUN
     assert prepare_step["env"]["MOLECULE_CI_REF"] == MOLECULE_CI_REF
+    assert "GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0" in prepare
+    assert "credential.helper=" in prepare
+    assert "http.userAgent=curl/8.4.0" in prepare
     assert 'fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"' in prepare
     assert "rev-parse HEAD" in prepare
     assert 'mcp_pin_lockstep.py"' in prepare
