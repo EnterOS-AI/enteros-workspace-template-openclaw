@@ -1,5 +1,6 @@
 """Contract checks for exact runtime provenance in pull-request image builds."""
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,10 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".gitea" / "workflows" / "ci.yml"
+META_WORKFLOW = ROOT / ".gitea" / "workflows" / "meta-ci-advisory.yml"
+MOLECULE_CI_REF = "11b8598e5c0b3f0b1031733a8d5f6bc238f146a4"
+CANONICAL_META_SHA256 = "24bae0ffc8e6cae1b5b3fdc1b7c80640796cfc8c8d5165bef2baad2831661937"
+FORK_RUN = "github.event.pull_request.head.repo.fork != true"
 
 
 def _docker_build_script(job_name: str) -> str:
@@ -83,3 +88,51 @@ def test_checkout_credentials_never_persist() -> None:
 
     assert checkouts
     assert all(step.get("with", {}).get("persist-credentials") is False for step in checkouts)
+
+
+def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> None:
+    steps = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["t4-conformance"]["steps"]
+    prepare_step = next(
+        step
+        for step in steps
+        if "mcp_pin_lockstep.py" in step.get("run", "")
+    )
+    prepare = prepare_step["run"]
+    build_step = next(
+        step for step in steps if "docker build" in step.get("run", "")
+    )
+    build = build_step["run"]
+
+    assert prepare_step["if"] == FORK_RUN
+    assert build_step["if"] == FORK_RUN
+    assert prepare_step["env"]["MOLECULE_CI_REF"] == MOLECULE_CI_REF
+    assert 'fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"' in prepare
+    assert 'rev-parse HEAD' in prepare
+    assert 'mcp_pin_lockstep.py"' in prepare
+    assert "--repo-root . --json" in prepare
+    assert "load_attestation" in prepare
+    assert 'EXPECTED_RUNTIME_VERSION="$(<' in build
+    assert '--build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION"' in build
+    assert build.count("docker build") == 1
+
+    required_fragments = (
+        "docker run --rm -i --network none",
+        "--user 1000:1000 --workdir /tmp",
+        "--cap-drop ALL --security-opt no-new-privileges",
+        "--pids-limit 128 --memory 768m --cpus 1",
+        "--tmpfs /tmp:size=64m",
+        'mcp_built_image_e2e.py:ro"',
+        '--entrypoint python3 "$T4_TAG"',
+        '< "$MCP_ATTESTATION"',
+        "mcp-built-image-e2e:sentinel:executed",
+    )
+    for fragment in required_fragments:
+        assert fragment in build
+    assert build.index("docker build") < build.index("docker run --rm -i")
+    assert build.index("docker run --rm -i") < build.index("KEEP_T4_IMAGE=1")
+
+
+def test_meta_ci_advisory_is_the_immutable_canonical_copy() -> None:
+    payload = META_WORKFLOW.read_bytes()
+
+    assert hashlib.sha256(payload).hexdigest() == CANONICAL_META_SHA256
