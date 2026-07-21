@@ -1,8 +1,8 @@
 name: CI
 
-# Repository-local validation pipeline. It clones the canonical validator
-# from molecule-ci on each run, while keeping this repository's protected
-# context names and runner requirements explicit.
+# Repository-local validation pipeline. It fetches the canonical validator
+# from molecule-ci at a reviewed immutable commit on each run, while keeping
+# this repository's protected context names and runner requirements explicit.
 #
 # Workflow compatibility choices:
 #   - No workflow_dispatch.inputs
@@ -31,6 +31,8 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  # Canonical validation tooling is reviewed and content-addressed.
+  MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
 
 permissions:
   contents: read
@@ -44,8 +46,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       - name: Check for secrets
         run: |
           python3 - << 'PYEOF'
@@ -185,9 +210,32 @@ jobs:
       - name: Skip executable validation for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::runtime installation, imports, tests, and Docker builds are disabled for external forks"
-      - name: Fetch molecule-ci canonical scripts
+      - name: Fetch immutable molecule-ci canonical scripts
         if: github.event.pull_request.head.repo.fork != true
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       - name: Install canonical validator dependencies
         if: github.event.pull_request.head.repo.fork != true
         run: python3 -m pip install --isolated --break-system-packages -q pyyaml jsonschema packaging
@@ -458,9 +506,32 @@ jobs:
       - name: Skip executable tests for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::dependency installation and repository tests are disabled for external forks"
-      - name: Fetch molecule-ci canonical scripts
+      - name: Fetch immutable molecule-ci canonical scripts
         if: github.event.pull_request.head.repo.fork != true
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       # molecule-ai-sdk (molecule_plugin) is the ADR-004 conformance-suite home
       # (tests/test_conformance.py inherits AdapterConformance FROM the SDK), so
       # it is a test-time dependency alongside the runtime engine. Public test

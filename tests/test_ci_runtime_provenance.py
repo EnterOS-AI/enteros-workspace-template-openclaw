@@ -24,8 +24,8 @@ def test_ci_acquires_runtime_only_through_canonical_installer() -> None:
 
     assert "--extra-index-url" not in workflow
     assert workflow.count(RUNTIME_INSTALLER) == 2
-    assert workflow.count("git clone --depth 1 ") == 3
-    assert workflow.count("molecule-ci.git .molecule-ci-canonical") == 3
+    assert workflow.count("Fetch immutable molecule-ci canonical scripts") == 3
+    assert "git clone --depth 1 " not in workflow
 
     jobs = load_ci_workflow()["jobs"]
     for job_name in ("validate-runtime", "tests"):
@@ -35,8 +35,14 @@ def test_ci_acquires_runtime_only_through_canonical_installer() -> None:
             for index, command in enumerate(commands)
             if RUNTIME_INSTALLER in command
         )
+        fetch_index = next(
+            index
+            for index, command in enumerate(commands)
+            if "molecule-ai/molecule-ci.git" in command
+        )
         prerequisites = "\n".join(commands[:installer_index])
-        assert "molecule-ci.git .molecule-ci-canonical" in prerequisites
+        assert fetch_index < installer_index
+        assert 'origin "$MOLECULE_CI_REF"' in commands[fetch_index]
         assert "packaging" in prerequisites
 
 
