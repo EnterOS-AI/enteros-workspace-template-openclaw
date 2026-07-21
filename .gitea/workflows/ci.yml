@@ -343,8 +343,10 @@ jobs:
           fi
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           MCP_VERIFY_LOG="$RUNNER_TEMP/mcp-built-image-e2e-$RUN_SUFFIX.log"
+          MCP_VERIFY_CONTAINER="mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           KEEP_T4_IMAGE=0
           cleanup_t4_build() {
+            docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
             if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
               docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
             fi
@@ -360,15 +362,20 @@ jobs:
             exit 1
           fi
           rm -f "$MCP_VERIFY_LOG"
-          docker run --rm -i --network none \
+          docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
+          docker create --interactive --name "$MCP_VERIFY_CONTAINER" \
+            --network none \
             --user 1000:1000 --workdir /tmp \
             --cap-drop ALL --security-opt no-new-privileges \
             --pids-limit 128 --memory 768m --cpus 1 \
             --tmpfs /tmp:size=64m \
-            --volume "$MOLECULE_CI_ROOT/scripts/mcp_built_image_e2e.py:/opt/molecule-ci/mcp_built_image_e2e.py:ro" \
             --entrypoint python3 "$T4_TAG" \
-            /opt/molecule-ci/mcp_built_image_e2e.py \
+            /mcp_built_image_e2e.py >/dev/null
+          docker cp "$MOLECULE_CI_ROOT/scripts/mcp_built_image_e2e.py" \
+            "$MCP_VERIFY_CONTAINER:/mcp_built_image_e2e.py"
+          docker start --attach --interactive "$MCP_VERIFY_CONTAINER" \
             < "$MCP_ATTESTATION" | tee "$MCP_VERIFY_LOG"
+          docker rm "$MCP_VERIFY_CONTAINER" >/dev/null
           if ! grep -qxF 'mcp-built-image-e2e:sentinel:executed' "$MCP_VERIFY_LOG"; then
             echo "::error::final-image management-MCP verifier sentinel is missing"
             exit 1
