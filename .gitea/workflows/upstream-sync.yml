@@ -1,0 +1,152 @@
+name: upstream-sync
+
+# Daily openclaw freshness bot (2026-07-22, principal directive: "keep at
+# least once a day sync so everything is up to date").
+#
+# Watches the public npm registry for a new openclaw release and opens a bump
+# PR against the OPENCLAW_VERSION ARG in the Dockerfile. NOT a scheduled CI
+# gate: molecule-core's zero-cron ratchet forbids timer-driven TEST runs
+# (nobody blocks on a red nightly); this job runs no tests and gates nothing —
+# it only surfaces a reviewable bump PR, which then goes through the normal
+# per-PR CI like any human-authored change. Humans (or the org's agents) still
+# gate the merge — same contract as the runtime .runtime-version propagate bot.
+#
+# Idempotent: skips when the pin already matches, when the sync branch already
+# exists, or when a bump PR is already open. PRs are opened purely via the
+# Gitea contents+pulls API (no git clone, so the bot token never lands in an
+# on-disk clone URL) — same approach as runtime's propagate job.
+#
+# AUTH: RUNTIME_BOT_TOKEN from the Infisical SSOT (/shared/runtime-bot) via
+# the INFISICAL_CI_* machine identity — the same bot credential that already
+# opens .runtime-version bump PRs on this repo. Absent bootstrap creds degrade
+# to report-only (config gap must not paint the repo red); present-but-broken
+# fetch fails loudly.
+
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check npm for a newer openclaw and open a bump PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Fetch RUNTIME_BOT_TOKEN from Infisical SSOT
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -z "${INFISICAL_CI_CLIENT_ID:-}" ] || [ -z "${INFISICAL_CI_CLIENT_SECRET:-}" ] || [ -z "${INFISICAL_PROJECT_ID:-}" ]; then
+            echo "::warning::INFISICAL_CI_* bootstrap creds absent; sync degrades to report-only."
+            exit 0
+          fi
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);v=d.get("accessToken");print(v if isinstance(v,str) and v else "")')
+          if [ -z "${TOK}" ]; then
+            echo "::error::Infisical universal-auth login failed with creds present — real infra fault." >&2
+            exit 1
+          fi
+          BOT=$(curl -fsS "$BASE/api/v3/secrets/raw/RUNTIME_BOT_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fruntime-bot" \
+            -H "Authorization: Bearer $TOK" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);v=(d.get("secret") or {}).get("secretValue");print(v if isinstance(v,str) and v else "")')
+          if [ -z "${BOT}" ]; then
+            echo "::error::Infisical returned empty RUNTIME_BOT_TOKEN at /shared/runtime-bot — failing loudly." >&2
+            exit 1
+          fi
+          echo "::add-mask::$BOT"
+          echo "BOT_TOKEN=$BOT" >> "$GITHUB_ENV"
+
+      - name: Compare npm latest against the Dockerfile pin; open bump PR
+        env:
+          BOT_TOKEN: ${{ env.BOT_TOKEN }}
+          API: ${{ env.GITHUB_SERVER_URL }}/api/v1
+          REPO: molecule-ai/molecule-ai-workspace-template-openclaw
+        run: |
+          set -euo pipefail
+          LATEST=$(curl -fsS --max-time 30 https://registry.npmjs.org/openclaw/latest \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["version"])')
+          CURRENT=$(sed -n 's/^ARG OPENCLAW_VERSION=//p' Dockerfile | head -1)
+          echo "npm latest=$LATEST pinned=$CURRENT"
+          if [ -z "$LATEST" ] || [ -z "$CURRENT" ]; then
+            echo "::error::could not resolve versions (latest='$LATEST' pinned='$CURRENT')"; exit 1
+          fi
+          if [ "$LATEST" = "$CURRENT" ]; then
+            echo "pin is current — nothing to do"; exit 0
+          fi
+          if [ -z "${BOT_TOKEN:-}" ]; then
+            echo "::warning::report-only (no BOT_TOKEN): openclaw $CURRENT -> $LATEST bump needed."
+            exit 0
+          fi
+          python3 - "$LATEST" "$CURRENT" <<'PYEOF'
+          import base64, json, os, sys, urllib.request
+
+          latest, current = sys.argv[1], sys.argv[2]
+          api = os.environ["API"]; repo = os.environ["REPO"]
+          tok = os.environ["BOT_TOKEN"]
+          branch = f"sync/openclaw-{latest}"
+
+          def req(method, path, body=None, ok=(200, 201)):
+              r = urllib.request.Request(
+                  f"{api}{path}", method=method,
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers={"Authorization": f"token {tok}",
+                           "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(r) as resp:
+                      return resp.status, json.load(resp)
+              except urllib.error.HTTPError as e:
+                  return e.code, {}
+
+          # Idempotency: existing branch or open PR means a previous tick
+          # already surfaced this bump — nothing to do.
+          st, _ = req("GET", f"/repos/{repo}/branches/{branch}")
+          if st == 200:
+              print(f"branch {branch} already exists — skipping"); sys.exit(0)
+          st, prs = req("GET", f"/repos/{repo}/pulls?state=open")
+          for p in (prs if isinstance(prs, list) else []):
+              if p.get("head", {}).get("ref", "").startswith("sync/openclaw-"):
+                  print("bump PR already open — skipping"); sys.exit(0)
+
+          st, meta = req("GET", f"/repos/{repo}/contents/Dockerfile?ref=main")
+          assert st == 200, f"contents GET {st}"
+          text = base64.b64decode(meta["content"]).decode()
+          needle = f"ARG OPENCLAW_VERSION={current}"
+          assert text.count(needle) == 1, "pin line not found exactly once"
+          text = text.replace(needle, f"ARG OPENCLAW_VERSION={latest}")
+
+          st, _ = req("PUT", f"/repos/{repo}/contents/Dockerfile", {
+              "message": f"chore(sync): bump openclaw {current} -> {latest} (daily upstream sync)",
+              "content": base64.b64encode(text.encode()).decode(),
+              "sha": meta["sha"], "branch": "main", "new_branch": branch,
+          })
+          assert st in (200, 201), f"contents PUT {st}"
+
+          st, pr = req("POST", f"/repos/{repo}/pulls", {
+              "title": f"chore(sync): bump openclaw {current} -> {latest}",
+              "head": branch, "base": "main",
+              "body": ("Automated daily upstream sync: npm reports openclaw "
+                       f"{latest} (pinned: {current}). Per-PR CI gates the "
+                       "merge as usual."),
+          })
+          assert st in (200, 201), f"pulls POST {st}"
+          print(f"opened bump PR #{pr.get('number')} for openclaw {latest}")
+          PYEOF
