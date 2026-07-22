@@ -109,7 +109,11 @@ jobs:
                   f"{api}{path}", method=method,
                   data=json.dumps(body).encode() if body is not None else None,
                   headers={"Authorization": f"token {tok}",
-                           "Content-Type": "application/json"})
+                           "Content-Type": "application/json",
+                           # Cloudflare bot-fight bans urllib's default UA
+                           # at the edge (error 1010) — spoof the fleet's
+                           # standard curl UA (see sync-providers-yaml.yml).
+                           "User-Agent": "curl/8.4.0"})
               try:
                   with urllib.request.urlopen(r) as resp:
                       return resp.status, json.load(resp)
