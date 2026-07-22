@@ -45,6 +45,16 @@ declared in `OPENCLAW_PROVIDERS` and `config.yaml`.
 Never commit credentials or put them in command-line examples. Configure them
 through workspace/platform secret surfaces.
 
+## Upstream freshness
+
+The openclaw CLI is version-pinned as `ARG OPENCLAW_VERSION` in the
+Dockerfile (a floating `npm install -g openclaw` used to freeze whatever
+was latest at the last rebuild and made builds non-reproducible). A daily
+bot (`.gitea/workflows/upstream-sync.yml`, 06:23 UTC + manual dispatch)
+checks the npm registry and opens a bump PR when a newer release ships.
+Bump PRs go through the normal per-PR CI — the bot only surfaces work, it
+never gates or lands anything.
+
 ## Development and delivery
 
 See [`runbooks/local-dev-setup.md`](runbooks/local-dev-setup.md) for the commands
