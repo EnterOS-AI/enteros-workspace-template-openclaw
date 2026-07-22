@@ -27,7 +27,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install OpenClaw CLI. Fail loud if install or version probe fails — previously
 # this had `|| true` which silently shipped a broken image (see internal#418).
-RUN npm install -g openclaw \
+# PINNED (2026-07-22): a floating `npm install -g openclaw` froze whatever was
+# latest at the last image REBUILD (cache keys on this repo's HEAD sha), so the
+# baked CLI silently aged between template commits AND two builds of the same
+# sha could differ. The daily upstream-sync workflow watches the npm registry
+# and opens a bump PR here when a newer release ships — upgrades become
+# explicit, reviewable commits that also trigger the rebuild.
+ARG OPENCLAW_VERSION=2026.7.1-2
+RUN npm install -g "openclaw@${OPENCLAW_VERSION}" \
     && openclaw --version
 
 # Create agent user — UNCHANGED. The agent runs as uid-1000; the T4
