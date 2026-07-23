@@ -125,10 +125,26 @@ jobs:
           st, _ = req("GET", f"/repos/{repo}/branches/{branch}")
           if st == 200:
               print(f"branch {branch} already exists — skipping"); sys.exit(0)
+          # Stale-PR handling (review wf_7cb5003d #10): an open bump PR for
+          # the SAME version means a previous tick already surfaced this
+          # bump — skip. An open bump PR for an OLDER version must NOT
+          # block newer releases forever (a red/unreviewed 0.19.1 PR would
+          # otherwise stall a 0.19.2 security fix indefinitely): close it
+          # with a comment and fall through to open the fresh one.
           st, prs = req("GET", f"/repos/{repo}/pulls?state=open")
           for p in (prs if isinstance(prs, list) else []):
-              if p.get("head", {}).get("ref", "").startswith("sync/openclaw-"):
-                  print("bump PR already open — skipping"); sys.exit(0)
+              ref = p.get("head", {}).get("ref", "")
+              if not ref.startswith("sync/openclaw-"):
+                  continue
+              if ref == branch:
+                  print("bump PR for this version already open — skipping"); sys.exit(0)
+              num = p.get("number")
+              req("POST", f"/repos/{repo}/issues/{num}/comments", {
+                  "body": f"Superseded by a newer upstream release ({latest}); closing so the daily sync can surface it.",
+              })
+              st, _ = req("PATCH", f"/repos/{repo}/pulls/{num}", {"state": "closed"})
+              print(f"closed stale bump PR #{num} ({ref}) -> {st}")
+              req("DELETE", f"/repos/{repo}/branches/{ref}")
 
           st, meta = req("GET", f"/repos/{repo}/contents/Dockerfile?ref=main")
           assert st == 200, f"contents GET {st}"
