@@ -26,9 +26,12 @@ name: publish-image
 # an updated `.runtime-version` file to this repo's main branch, which trips
 # the `on: push: branches: [main]` trigger here.
 
+# Serialize, never cancel: a publish is an ordered registry-push + staging-pin
+# transaction; cancelling it midway leaves :latest and the pin inconsistent
+# (reviews 17431/17463). Same shape as workspace-template-hermes.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: publish-image-openclaw
+  cancel-in-progress: false
 on:
   push:
     branches: [main]
