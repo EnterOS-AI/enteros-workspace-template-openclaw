@@ -102,8 +102,13 @@ async def test_persona_assembled_into_soul_with_guardrail(tmp_path, monkeypatch)
     body = soul.read_text()
     # The delivered persona reached SOUL.md …
     assert "ACME Agent — the Org Concierge" in body
-    # … layered under the assembled platform frame …
-    assert "Molecule AI platform" in body
+    # … layered under the assembled platform frame. Compare against the runtime's
+    # own BASE_PLATFORM_PROMPT heading, never a product-name literal: runtime
+    # >= 0.4.88 (runtime#411) reads the display name from its branding SSOT, so a
+    # hardcoded name breaks on every rename.
+    frame_heading = _prompt.BASE_PLATFORM_PROMPT.splitlines()[0]
+    assert frame_heading.startswith("# You are a workspace on "), frame_heading
+    assert frame_heading in body
     # … WITH the orchestrator-only guardrail (concierge gate was True).
     assert "you NEVER do the work yourself" in body.lower() or "NEVER do the work yourself" in body
     # SSOT: the assembled prompt is published back on the config.
