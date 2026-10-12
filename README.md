@@ -42,6 +42,14 @@ this repository. Supported direct prefixes currently include OpenAI, Groq,
 OpenRouter, Qianfan, MiniMax, and Moonshot/Kimi, with the credential names
 declared in `OPENCLAW_PROVIDERS` and `config.yaml`.
 
+MiniMax M3 is the default: `minimax/MiniMax-M3` uses the Molecule platform
+proxy when the resolved provider is `platform`, without a tenant vendor
+key. `MOLECULE_LLM_DEFAULT_MODEL` overrides the adapter's platform fallback
+at startup. Explicit workspace model selections take precedence, and
+MiniMax M2.7 remains selectable through the platform and direct routes.
+Older BYOK workspaces retain the registered `minimax:MiniMax-M2.7` fallback
+when the shared runtime supplies an unsupported generic model.
+
 Never commit credentials or put them in command-line examples. Configure them
 through workspace/platform secret surfaces.
 

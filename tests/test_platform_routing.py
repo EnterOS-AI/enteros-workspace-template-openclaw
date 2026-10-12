@@ -30,16 +30,18 @@ if adapter is None:
 PROXY = "https://api.moleculesai.app/api/v1/internal/llm/openai/v1"
 
 
-def test_not_platform_returns_none():
+@pytest.mark.parametrize("model", ["minimax:MiniMax-M2.7", "minimax:MiniMax-M2.7-highspeed"])
+def test_not_platform_returns_none(model):
     # provider != platform / unset -> no override; the colon registry path
     # runs as before. A bare vendor model with no platform signal is BYOK.
-    assert adapter.resolve_platform_routing("minimax:MiniMax-M2.7", {}) is None
+    assert adapter.resolve_platform_routing(model, {}) is None
     assert adapter.resolve_platform_routing(
         "moonshot:kimi-k2.6", {"LLM_PROVIDER": "minimax"}
     ) is None
 
 
-def test_platform_provider_routes_to_proxy_openai_surface():
+@pytest.mark.parametrize("selected_model", ["minimax/MiniMax-M3", "minimax/MiniMax-M2.7", "moonshot/kimi-k2.6"])
+def test_platform_provider_routes_to_proxy_openai_surface(selected_model):
     # provider==platform via LLM_PROVIDER (the signal core injects for
     # platform-routed workspaces) selects the platform arm.
     env = {
@@ -47,8 +49,8 @@ def test_platform_provider_routes_to_proxy_openai_surface():
         "MOLECULE_LLM_BASE_URL": PROXY,
         "MOLECULE_LLM_USAGE_TOKEN": "tok-123",
     }
-    key, url, model, compat = adapter.resolve_platform_routing("moonshot/kimi-k2.6", env)
-    assert (key, url, model, compat) == ("tok-123", PROXY, "moonshot/kimi-k2.6", "openai")
+    key, url, model, compat = adapter.resolve_platform_routing(selected_model, env)
+    assert (key, url, model, compat) == ("tok-123", PROXY, selected_model, "openai")
 
 
 def test_model_provider_legacy_alias_also_selects_platform():
@@ -106,14 +108,15 @@ def test_fail_closed_when_platform_unconfigured():
 # any other arm is BYOK and must NOT be re-derived from LLM_PROVIDER/MODEL_
 # PROVIDER or the model namespace. Only when ABSENT do the legacy signals apply.
 
-def test_resolved_provider_platform_routes_to_proxy():
+@pytest.mark.parametrize("selected_model", ["minimax/MiniMax-M3", "minimax/MiniMax-M2.7", "moonshot/kimi-k2.6"])
+def test_resolved_provider_platform_routes_to_proxy(selected_model):
     env = {
         "MOLECULE_RESOLVED_PROVIDER": "platform",
         "MOLECULE_LLM_BASE_URL": PROXY,
         "MOLECULE_LLM_USAGE_TOKEN": "tok-ssot",
     }
-    key, url, model, compat = adapter.resolve_platform_routing("moonshot/kimi-k2.6", env)
-    assert (key, url, model, compat) == ("tok-ssot", PROXY, "moonshot/kimi-k2.6", "openai")
+    key, url, model, compat = adapter.resolve_platform_routing(selected_model, env)
+    assert (key, url, model, compat) == ("tok-ssot", PROXY, selected_model, "openai")
 
 
 def test_resolved_provider_byok_arm_is_not_platform():

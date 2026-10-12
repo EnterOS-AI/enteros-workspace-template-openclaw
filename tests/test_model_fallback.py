@@ -23,8 +23,10 @@ and these tests are skipped (mirrors the validator's soft-skip).
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
+import yaml
 
 # tests/conftest.py pre-loads adapter.py as the top-level `adapter`
 # module straight from its file path (the same way molecule-runtime /
@@ -40,8 +42,43 @@ if "adapter" not in sys.modules:
 adapter = sys.modules["adapter"]
 
 
+@pytest.mark.parametrize("configured", [None, "", "   "])
+def test_unconfigured_default_matches_template_and_menu(monkeypatch, configured):
+    if configured is None:
+        monkeypatch.delenv("MOLECULE_LLM_DEFAULT_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("MOLECULE_LLM_DEFAULT_MODEL", configured)
+
+    config = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config.yaml").read_text(encoding="utf-8")
+    )
+    default = adapter._platform_default_model()
+    assert default == "minimax/MiniMax-M3"
+    assert config["model"] == config["runtime_config"]["model"] == default
+    models = config["runtime_config"]["models"]
+    assert models[0]["id"] == default
+    assert models[0]["required_env"] == []
+    assert models[0]["provider"] == "platform"
+    assert len({model["id"] for model in models}) == len(models)
+
+
+@pytest.mark.parametrize(
+    "configured, platform",
+    [
+        ("minimax/MiniMax-M3", "minimax/MiniMax-M3"),
+        (" minimax/MiniMax-M2.7 ", "minimax/MiniMax-M2.7"),
+        ("minimax:MiniMax-M2.7", "minimax/MiniMax-M2.7"),
+        ("openai/gpt-4o", "openai/gpt-4o"),
+    ],
+)
+def test_configured_platform_default_preserves_byok_rescue(monkeypatch, configured, platform):
+    monkeypatch.setenv("MOLECULE_LLM_DEFAULT_MODEL", configured)
+    assert adapter._platform_default_model() == platform
+    assert adapter.coerce_servable_model("anthropic:claude-opus-4-7") == "minimax:MiniMax-M2.7"
+
+
 class TestCoerceServableModel:
-    def test_unroutable_anthropic_default_falls_back_to_template_default(self):
+    def test_unroutable_anthropic_default_falls_back_to_legacy_byok_model(self):
         """The exact prod failure: load_config's anthropic default must
         be coerced to a model OpenClaw can actually route."""
         out = adapter.coerce_servable_model("anthropic:claude-opus-4-7")
@@ -61,6 +98,7 @@ class TestCoerceServableModel:
             "groq:llama-3.3-70b-versatile",
             "openrouter:anthropic/claude-sonnet-4-5",
             "qianfan:ernie-4.0",
+            "minimax:MiniMax-M2.7",
             "minimax:MiniMax-M2.7-highspeed",
             "moonshot:kimi-k2.6",
         ],

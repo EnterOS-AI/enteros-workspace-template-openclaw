@@ -326,52 +326,23 @@ def _materialize_openclaw_persona(config_path, persona: str):
         )
     return target
 
-# This template's declared default model — mirrors config.yaml's `model:`
-# field. Two hard constraints (both required; routability alone is NOT
-# enough — that gap is the second root cause this default fixes):
-#
-#  1. Its provider prefix MUST exist in OPENCLAW_PROVIDERS above so the
-#     adapter can structurally route it (PR#18's invariant).
-#  2. Its provider's required env key MUST be the credential a *fresh*
-#     openclaw workspace genuinely receives. The earlier
-#     `openai:gpt-4.1-mini` satisfied (1) but NOT (2): a fresh prod
-#     openclaw workspace is provisioned with a `sk-cp-*`
-#     ``MINIMAX_API_KEY`` (the seeded `custom-api-minimaxi-com`
-#     provider), NOT an ``OPENAI_API_KEY``. So coerce_servable_model
-#     correctly rewrote the unroutable ``anthropic:`` generic default to
-#     ``openai:gpt-4.1-mini``, but resolve_provider_routing then raised
-#     ``No API key found for provider 'openai' (checked: OPENAI_API_KEY)``
-#     and aborted setup() before the platform MCP was ever registered —
-#     bricking list_peers on every default-config provision.
-#
-# THE single shared platform-default model is the Infisical SSOT
-# ``MOLECULE_LLM_DEFAULT_MODEL`` (/shared/controlplane/llm), read at import. The
-# literal below is only the LAST-RESORT fallback when that env is unset, and it
-# matches the CP/core ``platformDefaultModelFallback`` (minimax/MiniMax-M2.7).
-#
-# Both forms below now derive from the SAME shared value, removing the prior
-# divergence where the BYOK default was MiniMax but the platform default was Kimi
-# (moonshot/kimi-k2.6) — a fresh platform_managed openclaw and a fresh BYOK
-# openclaw now resolve the SAME default, never two different vendors. ``minimax``
-# is in OPENCLAW_PROVIDERS and ``MINIMAX_API_KEY`` is the credential a fresh
-# openclaw workspace actually has (the seeded ``custom-api-minimaxi-com`` sk-cp-*
-# provider; the step-2b routing override steers it to MiniMax's Anthropic-compat
-# endpoint), so the colon-form default is key-consistent on first boot.
-def _ssot_default_model(sep: str) -> str:
+# Platform defaults follow the shared environment value at startup. The fallback
+# matches config.yaml and the CP/core platformDefaultModelFallback. Explicit
+# workspace models pass through resolve_platform_routing unchanged.
+def _platform_default_model() -> str:
     raw = (os.environ.get("MOLECULE_LLM_DEFAULT_MODEL") or "").strip()
     if not raw:
-        raw = "minimax/MiniMax-M2.7"  # shared fallback == CP/core platformDefaultModelFallback
-    # openclaw's BYOK registry namespaces as ``<provider>:<model>`` (colon); the
-    # platform proxy uses ``<vendor>/<model>`` (slash). Normalise to the form the
-    # caller needs WITHOUT changing the model identity.
-    return raw.replace("/", ":", 1) if sep == ":" else raw.replace(":", "/", 1)
+        raw = "minimax/MiniMax-M3"
+    return raw.replace(":", "/", 1)
 
 
-# BYOK colon-form default for the per-vendor registry (coerce_servable_model).
-OPENCLAW_DEFAULT_MODEL = _ssot_default_model(":")
+# Legacy BYOK rescue for an unroutable generic runtime default. Keep the
+# registered colon model that older workspaces can serve with MINIMAX_API_KEY;
+# a platform default must not implicitly select an unregistered BYOK model.
+OPENCLAW_DEFAULT_MODEL = "minimax:MiniMax-M2.7"
 
 # Platform-managed slash-form default for the proxy (resolve_platform_routing).
-OPENCLAW_PLATFORM_DEFAULT_MODEL = _ssot_default_model("/")
+OPENCLAW_PLATFORM_DEFAULT_MODEL = _platform_default_model()
 
 
 def _parse_tools_list_body(body: str) -> list[str]:
@@ -506,8 +477,8 @@ def coerce_servable_model(model_str: str) -> str:
 
     A model this adapter cannot structurally serve must never be the
     effective default. When the resolved model's provider prefix isn't
-    one we know how to route, coerce to this template's own declared
-    default (``OPENCLAW_DEFAULT_MODEL``). An operator who explicitly
+    one we know how to route, use the legacy BYOK fallback
+    (``OPENCLAW_DEFAULT_MODEL``). An operator who explicitly
     sets MODEL/config.yaml to a real openclaw-registry model
     (openai/groq/openrouter/qianfan/minimax/moonshot) is unaffected —
     that prefix is in the registry, so it passes through untouched.
@@ -523,7 +494,7 @@ def coerce_servable_model(model_str: str) -> str:
         return model_str
     logger.warning(
         "Configured model %r has provider %r which OpenClaw cannot route "
-        "(known: %s); falling back to template default %r. Set MODEL "
+        "(known: %s); falling back to legacy BYOK model %r. Set MODEL "
         "(or config.yaml model:) to an OpenClaw-supported provider to override.",
         model_str, prefix, ",".join(sorted(OPENCLAW_PROVIDERS)), OPENCLAW_DEFAULT_MODEL,
     )
