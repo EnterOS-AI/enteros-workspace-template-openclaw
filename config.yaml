@@ -15,10 +15,9 @@ tier: 2
 # molecule-controlplane userdata_containerized.go. Track that under
 # SSOT audit comment 40629 finding #4.
 #
-# Model-id format is `<provider>:<vendor-model-id>` (colon-separated,
-# NOT slash-separated like hermes — matches adapter.py's `prefix, _,
-# _ = model_str.partition(":")` split). See coerce_servable_model for
-# the resolution path.
+# Direct model IDs use `<provider>:<vendor-model-id>` (colon-separated,
+# matching adapter.py's per-vendor routing). Platform model IDs use
+# `<vendor>/<model>` and resolve through the Molecule proxy.
 #
 # Schema per entry:
 #   name           : provider prefix (the substring before `:` in a
@@ -69,13 +68,9 @@ providers:
     auth_env: [KIMI_API_KEY]
 
 runtime: openclaw
-# Default model — must mirror adapter.py OPENCLAW_DEFAULT_MODEL. minimax
-# is in OPENCLAW_PROVIDERS AND MINIMAX_API_KEY is the credential a fresh
-# openclaw workspace actually receives (an sk-cp-* token via the seeded
-# custom-api-minimaxi-com provider); openai:* was routable but keyless
-# on fresh provisions, which bricked setup() before the platform MCP
-# was registered.
-model: minimax:MiniMax-M2.7
+# Platform default, matching adapter.py OPENCLAW_PLATFORM_DEFAULT_MODEL.
+# Core resolves its provider to platform and supplies proxy credentials.
+model: minimax/MiniMax-M3
 prompt_files:
 - SOUL.md
 - BOOTSTRAP.md
@@ -89,11 +84,14 @@ a2a:
   push_notifications: true
 template_schema_version: 1
 runtime_config:
-  model: minimax:MiniMax-M2.7
-  # First entry is the effective default — must match `model:` above and
-  # adapter.py OPENCLAW_DEFAULT_MODEL, and its required_env must be a key
-  # a fresh openclaw workspace genuinely has (MINIMAX_API_KEY).
+  model: minimax/MiniMax-M3
+  # First entry is the effective default and must match `model:` above.
+  # Platform models use the shared proxy, so no tenant vendor key is needed.
   models:
+  - id: minimax/MiniMax-M3
+    name: MiniMax M3 (Molecule platform)
+    provider: platform
+    required_env: []
   - id: minimax:MiniMax-M2.7
     name: MiniMax M2.7 (MiniMax)
     required_env:
@@ -150,10 +148,6 @@ runtime_config:
     required_env: []
   - id: minimax/MiniMax-M2.7-highspeed
     name: MiniMax M2.7 Highspeed (Molecule platform)
-    provider: platform
-    required_env: []
-  - id: minimax/MiniMax-M3
-    name: MiniMax M3 (Molecule platform)
     provider: platform
     required_env: []
   - id: moonshot/kimi-k2.6
