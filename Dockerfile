@@ -13,8 +13,8 @@ FROM python:3.11-slim
 #   /host (--privileged grants caps to root, not uid-1000) and cannot
 #   use the root:docker 0660 docker.sock — T4 would be
 #   provisioner-shape-only (the documented ABSENT-escalation-leg gap).
-#   Mirrors template-claude-code (proven, live-verified — ECR
-#   sha256:e1ae9795… / git bbc2dae). The sudoers drop-in + docker-group
+#   Mirrors the live-verified template-claude-code T4 contract. The
+#   sudoers drop-in + docker-group
 #   add are below, after useradd. ADDITIVE: does NOT change the agent
 #   uid and does NOT change /configs token ownership (still agent-owned,
 #   enforced by entrypoint.sh + the t4-conformance gate).
@@ -27,7 +27,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install OpenClaw CLI. Fail loud if install or version probe fails — previously
 # this had `|| true` which silently shipped a broken image (see internal#418).
-RUN npm install -g openclaw \
+# PINNED (2026-07-22): a floating `npm install -g openclaw` froze whatever was
+# latest at the last image REBUILD (cache keys on this repo's HEAD sha), so the
+# baked CLI silently aged between template commits AND two builds of the same
+# sha could differ. The daily upstream-sync workflow watches the npm registry
+# and opens a bump PR here when a newer release ships — upgrades become
+# explicit, reviewable commits that also trigger the rebuild.
+ARG OPENCLAW_VERSION=2026.7.1-2
+RUN npm install -g "openclaw@${OPENCLAW_VERSION}" \
     && openclaw --version
 
 # Create agent user — UNCHANGED. The agent runs as uid-1000; the T4
@@ -52,40 +59,45 @@ RUN set -eux; \
     chmod 0440 /etc/sudoers.d/agent-t4; \
     visudo -cf /etc/sudoers.d/agent-t4; \
     groupadd -f docker; \
+    groupadd -g 988 -f docker-host || true; \
     usermod -aG docker agent; \
+    usermod -aG docker-host agent || true; \
     id agent
 
 WORKDIR /app
 
-# RUNTIME_VERSION is forwarded from molecule-ci's reusable publish
+# RUNTIME_VERSION is forwarded from this repository's publish-image
 # workflow as a docker build-arg. Cascade-triggered builds set it to
-# the exact runtime version PyPI just published. Including it as an
+# the exact runtime version the private registry just published. Including it as an
 # ARG changes the cache key for the pip install layer below — the
 # fix for the cascade cache trap that bit us 5x on 2026-04-27.
 ARG RUNTIME_VERSION=
 
-# Gitea PyPI registry is the PRIMARY internal index per RFC internal#596
-# (Gitea PyPI middleman; CTO GO'd 2026-05-19). Anonymous reads work because
-# `molecule-ai` is a public org — no auth needs to be wired into the build.
-# pypi.org is kept as best-effort fallback for transitive deps that are
-# only on PyPI (everything-except-our-runtime). This removes the vendor
-# SPOF that bit us 2026-05-19 (compounded PyPI abuse-block + Railway
-# outage; internal#593 + #595) and unblocks publishes of versions that
-# Gitea-only has (e.g. workspace-runtime 0.1.1013+ / 0.2.0+).
-ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
-ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
+# Acquire the private runtime from the Gitea package registry before resolving
+# its public dependencies. Keeping the private and public indexes in separate
+# pip commands prevents dependency-confusion candidates from entering the
+# runtime wheel lookup. Anonymous reads are supported for this public org.
+ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir \
-      --index-url "${PIP_INDEX_URL}" \
-      --extra-index-url "${PIP_EXTRA_INDEX_URL}" \
-      -r requirements.txt && \
-    if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --upgrade \
-        --index-url "${PIP_INDEX_URL}" \
-        --extra-index-url "${PIP_EXTRA_INDEX_URL}" \
-        "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi
+COPY scripts/prepare-runtime-requirements.py /usr/local/bin/prepare-runtime-requirements.py
+RUN set -eux; \
+    runtime_project="molecules-workspace-runtime"; \
+    rm -rf /tmp/molecule-runtime; \
+    mkdir -p /tmp/molecule-runtime; \
+    runtime_requirement="$(python3 /usr/local/bin/prepare-runtime-requirements.py \
+      requirements.txt /tmp/template-requirements.txt "${RUNTIME_VERSION}")"; \
+    case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac; \
+    pip download --isolated --only-binary=:all: --no-deps \
+      --index-url "$MOLECULE_RUNTIME_INDEX" \
+      --dest /tmp/molecule-runtime \
+      "${runtime_requirement}"; \
+    runtime_wheel_count="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl' | wc -l)"; \
+    test "${runtime_wheel_count}" -eq 1; \
+    runtime_wheel="$(find /tmp/molecule-runtime -maxdepth 1 -type f -name 'molecules_workspace_runtime-*.whl')"; \
+    pip install --isolated --no-cache-dir \
+      "${runtime_wheel}" -r /tmp/template-requirements.txt; \
+    rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
 # The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
@@ -102,6 +114,22 @@ RUN pip install --no-cache-dir \
 USER agent
 RUN bash "$(python3 -c 'import molecule_runtime, os; print(os.path.dirname(molecule_runtime.__file__))')/scripts/prebake-mgmt-mcp.sh"
 USER root
+
+# Make the pre-baked mgmt-MCP npm cache + scoped-registry config HOME-INDEPENDENT.
+# Per contracts/mcp-plugin-delivery.contract.json `home_independent`: the
+# kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server`
+# under a HOME that is NOT guaranteed to be the agent home (observed HOME=/root in
+# the provisioner), so a per-user ${HOME}/.npmrc / ${HOME}/.npm is MISSED — npx
+# then falls through to the PUBLIC registry -> ETARGET on the private @molecule-ai
+# scope -> #1027 "management MCP FAILED TO LAUNCH" fail-close, EVEN THOUGH the
+# version is correctly baked. Reproduced: openclaw peer-visibility boot is ~6x
+# slower than hermes and flaps to `failed` under concurrent CF-WAF throttle;
+# hermes is unaffected because its runtime propagates the launch env. The prebake
+# helper can't `npm config set --global` (EACCES as the non-root agent), so pin
+# the two launch vars as container ENV instead — inherited by the mgmt-MCP spawn
+# regardless of HOME, pointing npx at the baked cache + scoped-registry npmrc.
+ENV npm_config_cache=/home/agent/.npm \
+    NPM_CONFIG_USERCONFIG=/home/agent/.npmrc
 
 
 COPY adapter.py .

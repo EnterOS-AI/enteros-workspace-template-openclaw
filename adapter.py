@@ -39,7 +39,7 @@ from a2a.server.agent_execution import AgentExecutor
 from molecule_runtime.subprocess_executor import SubprocessA2AExecutor
 
 # Turn-lease liveness (MUST-FIX 1) is provided by the mailbox-kernel runtime.
-# GUARDED: the template's requirements pin molecule-ai-workspace-runtime>=0.3.11,
+# GUARDED: the template requires molecules-workspace-runtime>=0.3.11,
 # and wheels predating the mailbox kernel do not ship molecule_runtime.turn_lease
 # — so a hard `from molecule_runtime import turn_lease` would break every turn on
 # an older runtime. Import it optionally; _lease_touch/_lease_reset below no-op
