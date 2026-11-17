@@ -328,12 +328,12 @@ def _materialize_openclaw_persona(config_path, persona: str):
 
 # Platform defaults follow the shared environment value at startup. The fallback
 # matches config.yaml and the CP/core platformDefaultModelFallback (Gemini 4
-# Carbon since 2026-11-17). Explicit workspace models pass through
+# Hydrogen since 2026-11-17). Explicit workspace models pass through
 # resolve_platform_routing unchanged.
 def _platform_default_model() -> str:
     raw = (os.environ.get("MOLECULE_LLM_DEFAULT_MODEL") or "").strip()
     if not raw:
-        raw = "google/gemini-4-carbon"
+        raw = "google/gemini-4-hydrogen"
     return raw.replace(":", "/", 1)
 
 

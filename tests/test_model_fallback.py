@@ -53,7 +53,7 @@ def test_unconfigured_default_matches_template_and_menu(monkeypatch, configured)
         (Path(__file__).resolve().parents[1] / "config.yaml").read_text(encoding="utf-8")
     )
     default = adapter._platform_default_model()
-    assert default == "google/gemini-4-carbon"
+    assert default == "google/gemini-4-hydrogen"
     assert config["model"] == config["runtime_config"]["model"] == default
     models = config["runtime_config"]["models"]
     assert models[0]["id"] == default
@@ -65,6 +65,8 @@ def test_unconfigured_default_matches_template_and_menu(monkeypatch, configured)
 @pytest.mark.parametrize(
     "configured, platform",
     [
+        ("google/gemini-4-hydrogen", "google/gemini-4-hydrogen"),
+        ("google:gemini-4-hydrogen", "google/gemini-4-hydrogen"),
         ("google/gemini-4-carbon", "google/gemini-4-carbon"),
         ("google/gemini-3.1-flash-lite", "google/gemini-3.1-flash-lite"),
         ("google:gemini-4-carbon", "google/gemini-4-carbon"),
