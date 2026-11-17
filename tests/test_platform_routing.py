@@ -40,7 +40,7 @@ def test_not_platform_returns_none(model):
     ) is None
 
 
-@pytest.mark.parametrize("selected_model", ["google/gemini-4-carbon", "google/gemini-3.1-flash-lite", "minimax/MiniMax-M3", "minimax/MiniMax-M2.7", "moonshot/kimi-k2.6"])
+@pytest.mark.parametrize("selected_model", ["google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-3.1-flash-lite", "minimax/MiniMax-M3", "minimax/MiniMax-M2.7", "moonshot/kimi-k2.6"])
 def test_platform_provider_routes_to_proxy_openai_surface(selected_model):
     # provider==platform via LLM_PROVIDER (the signal core injects for
     # platform-routed workspaces) selects the platform arm.
@@ -108,7 +108,7 @@ def test_fail_closed_when_platform_unconfigured():
 # any other arm is BYOK and must NOT be re-derived from LLM_PROVIDER/MODEL_
 # PROVIDER or the model namespace. Only when ABSENT do the legacy signals apply.
 
-@pytest.mark.parametrize("selected_model", ["google/gemini-4-carbon", "google/gemini-3.1-flash-lite", "minimax/MiniMax-M3", "minimax/MiniMax-M2.7", "moonshot/kimi-k2.6"])
+@pytest.mark.parametrize("selected_model", ["google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-3.1-flash-lite", "minimax/MiniMax-M3", "minimax/MiniMax-M2.7", "moonshot/kimi-k2.6"])
 def test_resolved_provider_platform_routes_to_proxy(selected_model):
     env = {
         "MOLECULE_RESOLVED_PROVIDER": "platform",

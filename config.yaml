@@ -70,9 +70,9 @@ providers:
 runtime: openclaw
 # Platform default, matching adapter.py OPENCLAW_PLATFORM_DEFAULT_MODEL.
 # Core resolves its provider to platform and supplies proxy credentials.
-# Gemini 4 Carbon since 2026-11-17 (the proxy serves google/* from Google AI
-# Studio).
-model: google/gemini-4-carbon
+# Gemini 4 Hydrogen since 2026-11-17 (the proxy serves google/* from Google AI
+# Studio; Gemini 4 Carbon stays on the menu).
+model: google/gemini-4-hydrogen
 prompt_files:
 - SOUL.md
 - BOOTSTRAP.md
@@ -86,10 +86,14 @@ a2a:
   push_notifications: true
 template_schema_version: 1
 runtime_config:
-  model: google/gemini-4-carbon
+  model: google/gemini-4-hydrogen
   # First entry is the effective default and must match `model:` above.
   # Platform models use the shared proxy, so no tenant vendor key is needed.
   models:
+  - id: google/gemini-4-hydrogen
+    name: Gemini 4 Hydrogen (Molecule platform)
+    provider: platform
+    required_env: []
   - id: google/gemini-4-carbon
     name: Gemini 4 Carbon (Molecule platform)
     provider: platform

@@ -42,9 +42,10 @@ this repository. Supported direct prefixes currently include OpenAI, Groq,
 OpenRouter, Qianfan, MiniMax, and Moonshot/Kimi, with the credential names
 declared in `OPENCLAW_PROVIDERS` and `config.yaml`.
 
-Gemini 4 Carbon is the default: `google/gemini-4-carbon` uses the Molecule
+Gemini 4 Hydrogen is the default: `google/gemini-4-hydrogen` uses the Molecule
 platform proxy (served from Google AI Studio) when the resolved provider is
-`platform`, without a tenant vendor key. Gemini 3.1 Flash-Lite
+`platform`, without a tenant vendor key. Gemini 4 Carbon
+(`google/gemini-4-carbon`), Gemini 3.1 Flash-Lite
 (`google/gemini-3.1-flash-lite`) and MiniMax M3 (`minimax/MiniMax-M3`) are also
 on the platform menu. `MOLECULE_LLM_DEFAULT_MODEL` overrides the adapter's
 platform fallback at startup. Explicit workspace model selections take
