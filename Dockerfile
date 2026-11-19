@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-# openclaw CLI requires Node 22.12+ (per `npm install -g openclaw` engine check).
+# openclaw CLI requires Node >=24.16.0 (or >=26.1.0) per `npm install -g openclaw` engine check.
 # Debian Bookworm/Trixie nodejs apt package ships v20.x — too old.
-# Install Node 22 from NodeSource instead. Verify with `node --version` at build time.
+# Install Node 24 LTS from NodeSource instead. Verify with `node --version` at build time.
 # T4 escalation leg (RFC internal#456 §9 / PR#474):
 #   sudo + util-linux(nsenter) + docker.io(CLI) are baked here so the
 #   uid-1000 `agent` (see useradd below — UNCHANGED, agent stays
@@ -20,10 +20,10 @@ FROM python:3.11-slim
 #   enforced by entrypoint.sh + the t4-conformance gate).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gosu ca-certificates gnupg sudo util-linux docker.io \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && node --version | grep -E '^v22\.' || (echo "::error::expected Node 22, got $(node --version)" >&2; exit 1)
+    && node --version | grep -E '^v24\.' || (echo "::error::expected Node 24, got $(node --version)" >&2; exit 1)
 
 # Install OpenClaw CLI. Fail loud if install or version probe fails — previously
 # this had `|| true` which silently shipped a broken image (see internal#418).
@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # sha could differ. The daily upstream-sync workflow watches the npm registry
 # and opens a bump PR here when a newer release ships — upgrades become
 # explicit, reviewable commits that also trigger the rebuild.
-ARG OPENCLAW_VERSION=2026.7.1-2
+ARG OPENCLAW_VERSION=2026.11.5
 RUN npm install -g "openclaw@${OPENCLAW_VERSION}" \
     && openclaw --version
 
