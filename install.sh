@@ -47,19 +47,19 @@ current_major() {
   node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1
 }
 
-if [ "$(current_major)" -ge 22 ]; then
-  echo "Node $(node --version) already satisfies >=22 — skipping install"
+if [ "$(current_major)" -ge 24 ]; then
+  echo "Node $(node --version) already satisfies >=24 — skipping install"
   exit 0
 fi
 
-echo "Installing Node 22 from nodesource (had: $(node --version 2>/dev/null || echo 'none'))"
+echo "Installing Node 24 from nodesource (had: $(node --version 2>/dev/null || echo 'none'))"
 
-# nodesource setup_22.x: configures /etc/apt/sources.list.d/nodesource.list
+# nodesource setup_24.x: configures /etc/apt/sources.list.d/nodesource.list
 # and refreshes apt cache. Re-running on an already-configured host is a
 # no-op, so this stays idempotent across reboots / re-runs.
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
 
-# `apt-get install -y nodejs` from nodesource provides Node 22 + npm 10.
+# `apt-get install -y nodejs` from nodesource provides Node 24 + npm.
 # --no-install-recommends keeps the install slim (no recommended-but-unused
 # build toolchain pulled in transitively).
 sudo apt-get install -y --no-install-recommends nodejs
