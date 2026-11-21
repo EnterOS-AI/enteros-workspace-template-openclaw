@@ -293,6 +293,44 @@ jobs:
             exit 1
           fi
           echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
+          # Offline k8s subPath smoke (internal#1333): simulate kubelet's 0:1000 02777 ~/.openclaw
+          # mount and prove adapter._openclaw_state_dir() isolates state into a 0700 subdir and
+          # `openclaw onboard --non-interactive` succeeds with native apiKey config (no legacy auth-profiles).
+          docker run --rm -i --network none --entrypoint /bin/bash "$SMOKE_TAG" <<'SMOKE_EOF'
+          set -euo pipefail
+          mkdir -p /home/agent/.openclaw
+          chown 0:1000 /home/agent/.openclaw
+          chmod 2777 /home/agent/.openclaw
+          gosu agent /bin/bash <<'AGENT_EOF'
+          set -euo pipefail
+          STATE_DIR="$(PYTHONPATH=/app python3 -c '
+          import adapter, os
+          d = adapter._openclaw_state_dir()
+          m = os.stat(d).st_mode & 0o7777
+          assert d == os.path.expanduser("~/.openclaw/state"), d
+          assert m == 0o700, oct(m)
+          print(d)
+          ')"
+          export OPENCLAW_STATE_DIR="$STATE_DIR"
+          openclaw onboard --non-interactive \
+            --workspace /home/agent/.openclaw/workspace \
+            --auth-choice custom-api-key \
+            --custom-base-url http://127.0.0.1:19999/v1 \
+            --custom-model-id google/gemini-4-hydrogen \
+            --custom-api-key smoke-key \
+            --custom-compatibility openai \
+            --secret-input-mode plaintext \
+            --accept-risk --skip-health
+          python3 -c '
+          import json, os
+          sd = os.environ["OPENCLAW_STATE_DIR"]
+          cfg = json.load(open(os.path.join(sd, "openclaw.json")))
+          assert cfg["gateway"]["mode"] == "local", cfg
+          assert not os.path.exists(os.path.join(sd, "agents", "main", "agent", "auth-profiles.json"))
+          '
+          AGENT_EOF
+          SMOKE_EOF
+          echo "Offline Kubernetes 2777 subPath + openclaw onboard smoke PASS"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
   # NOT a string-match. Builds the actual image, runs it under the EXACT

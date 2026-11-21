@@ -183,13 +183,53 @@ OPENCLAW_MCP_PARENT = "mcp"
 OPENCLAW_MCP_SERVERS = "servers"
 
 
-def _openclaw_config_path() -> str:
-    """Absolute path to ~/.openclaw/openclaw.json, resolved at CALL time.
+def _openclaw_state_dir() -> str:
+    """Resolve the OpenClaw state directory, isolating it from foreign-owned mounts.
 
-    Resolved per-call (not frozen at import) so it tracks $HOME — matching the
-    runtime's own ``_openclaw_path`` and the rest of this adapter, which all read
-    ``os.path.expanduser("~/.openclaw/...")`` at use time."""
-    return os.path.expanduser("~/.openclaw/openclaw.json")
+    On Kubernetes, kubelet creates ~/.openclaw as a subPath mount owned by
+    root:1000 with mode 02777. OpenClaw 2026.11.5+ rejects non-owner or setgid
+    state dirs during `onboard` ("created directory admission failed"). When
+    ~/.openclaw is not owned by the running uid (and OPENCLAW_STATE_DIR is not
+    explicitly overridden), store state in an agent-owned 0700 ~/.openclaw/state
+    subdirectory (chmod 0700 clears the inherited setgid bit).
+    """
+    override = (os.environ.get("OPENCLAW_STATE_DIR") or "").strip()
+    if override:
+        target = os.path.expanduser(override)
+        if os.path.isdir(target) and (not hasattr(os, "geteuid") or os.stat(target).st_uid == os.geteuid()):
+            try:
+                os.chmod(target, 0o700)
+            except OSError:
+                pass
+        return target
+    oc_root = os.path.expanduser("~/.openclaw")
+    if hasattr(os, "geteuid") and os.path.isdir(oc_root):
+        try:
+            st = os.stat(oc_root)
+            if st.st_uid != os.geteuid():
+                sub = os.path.join(oc_root, "state")
+                os.makedirs(sub, exist_ok=True)
+                os.chmod(sub, 0o700)
+                return sub
+        except OSError:
+            pass
+    return oc_root
+
+
+def _openclaw_cli_env(extra: dict | None = None) -> dict:
+    """Build subprocess env with OPENCLAW_STATE_DIR set when redirected/configured."""
+    env = os.environ.copy()
+    state_dir = _openclaw_state_dir()
+    if state_dir != os.path.expanduser("~/.openclaw") or (env.get("OPENCLAW_STATE_DIR") or "").strip():
+        env["OPENCLAW_STATE_DIR"] = state_dir
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _openclaw_config_path() -> str:
+    """Absolute path to openclaw.json inside the resolved OpenClaw state dir."""
+    return os.path.join(_openclaw_state_dir(), "openclaw.json")
 
 
 # Canonical name of the privileged org-management MCP, sourced from the runtime
@@ -577,6 +617,17 @@ class OpenClawAdapter(BaseAdapter):
             logger.info("MOLECULE_SMOKE_MODE=1 — skipping OpenClaw gateway spawn")
             return
 
+        state_dir = _openclaw_state_dir()
+        os.makedirs(state_dir, exist_ok=True)
+        if not hasattr(os, "geteuid") or os.stat(state_dir).st_uid == os.geteuid():
+            try:
+                os.chmod(state_dir, 0o700)
+            except OSError:
+                pass
+        if state_dir != os.path.expanduser("~/.openclaw"):
+            os.environ["OPENCLAW_STATE_DIR"] = state_dir
+        os.makedirs(OPENCLAW_WORKSPACE, exist_ok=True)
+
         npm_prefix = os.path.expanduser("~/.local")
         os.environ["PATH"] = f"{npm_prefix}/bin:{os.environ.get('PATH', '')}"
 
@@ -690,10 +741,12 @@ class OpenClawAdapter(BaseAdapter):
                 model = "kimi-for-coding"
 
         # 3. Run non-interactive onboard
-        if not os.path.exists(os.path.expanduser("~/.openclaw/openclaw.json")):
+        oc_config_path = _openclaw_config_path()
+        if not os.path.exists(oc_config_path):
             logger.info(f"Running OpenClaw onboard (model: {model}, compat: {compatibility})...")
-            subprocess.run(
+            onboard_res = subprocess.run(
                 ["openclaw", "onboard", "--non-interactive",
+                 "--workspace", OPENCLAW_WORKSPACE,
                  "--auth-choice", "custom-api-key",
                  "--custom-base-url", provider_url,
                  "--custom-model-id", model,
@@ -702,39 +755,47 @@ class OpenClawAdapter(BaseAdapter):
                  "--secret-input-mode", "plaintext",
                  "--accept-risk", "--skip-health"],
                 capture_output=True, text=True, timeout=60,
-                env={**os.environ, "NODE_NO_WARNINGS": "1"}
+                env=_openclaw_cli_env({"NODE_NO_WARNINGS": "1"}),
             )
+            if onboard_res.returncode != 0:
+                detail = (onboard_res.stderr or onboard_res.stdout or "").strip()[:600]
+                raise RuntimeError(f"OpenClaw onboard failed (rc={onboard_res.returncode}): {detail}")
             logger.info("OpenClaw onboard complete")
 
-        # 3b. Fix context window (OpenClaw defaults to 16K, but modern models have much more)
-        oc_config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+        # 3b. Fix context window and keep rotated provider apiKey synced in openclaw.json
+        # (OpenClaw 2026.11.5+ reads models.providers.<provider>.apiKey from openclaw.json
+        # directly; legacy flat auth-profiles.json triggers AUTH_PROFILE_MIGRATION_REQUIRED.)
         if os.path.exists(oc_config_path):
             try:
                 import json as json_mod
-                oc_cfg = json_mod.load(open(oc_config_path))
-                provider_name = "custom-" + provider_url.split("//")[1].split("/")[0].replace(".", "-")
+                with open(oc_config_path, encoding="utf-8") as _f:
+                    oc_cfg = json_mod.load(_f)
+                host_part = provider_url.split("//", 1)[1].split("/", 1)[0]
+                provider_name = "custom-" + host_part.replace(".", "-").replace(":", "-")
                 providers = oc_cfg.get("models", {}).get("providers", {})
                 if provider_name in providers:
+                    if api_key:
+                        providers[provider_name]["apiKey"] = api_key
                     for m in providers[provider_name].get("models", []):
                         m["contextWindow"] = 1000000  # 1M tokens for modern models
                         m["maxTokens"] = 16384
-                    json_mod.dump(oc_cfg, open(oc_config_path, "w"), indent=2)
-                    logger.info(f"Fixed context window for {provider_name}")
+                    with open(oc_config_path, "w", encoding="utf-8") as _f:
+                        json_mod.dump(oc_cfg, _f, indent=2)
+                    logger.info(f"Updated provider config for {provider_name}")
             except Exception as e:
-                logger.warning(f"Failed to fix context window: {e}")
+                logger.warning(f"Failed to update provider config in openclaw.json: {e}")
 
-        # 3c. Always write auth-profiles.json
-        # (key may have been set via secrets API after first boot)
-        if api_key:
-            auth_dir = os.path.expanduser("~/.openclaw/agents/main/agent")
-            os.makedirs(auth_dir, exist_ok=True)
-            auth_file = os.path.join(auth_dir, "auth-profiles.json")
-            import json as json_mod
-            provider_name = "custom-" + provider_url.split("//")[1].split("/")[0].replace(".", "-")
-            auth_data = {provider_name: {"type": "api-key", "key": api_key}}
-            with open(auth_file, "w") as f:
-                json_mod.dump(auth_data, f, indent=2)
-            logger.info(f"Wrote auth-profiles.json for {provider_name}")
+        # 3c. Remove legacy flat auth-profiles.json if left from an earlier image revision
+        legacy_auth_file = os.path.join(_openclaw_state_dir(), "agents", "main", "agent", "auth-profiles.json")
+        if os.path.exists(legacy_auth_file):
+            try:
+                with open(legacy_auth_file, encoding="utf-8") as _f:
+                    _legacy = json.load(_f)
+                if isinstance(_legacy, dict) and "profiles" not in _legacy:
+                    os.unlink(legacy_auth_file)
+                    logger.info("Removed legacy flat auth-profiles.json")
+            except (OSError, ValueError):
+                pass
 
         # 3d. Boot-time auth smoke probe for the configured route.
         #
@@ -898,23 +959,36 @@ class OpenClawAdapter(BaseAdapter):
         # 5. Start the gateway as a background process
         gateway_port = config.runtime_config.get("gateway_port", OPENCLAW_PORT)
         logger.info(f"Starting OpenClaw gateway on port {gateway_port}...")
-        env = os.environ.copy()
-        env["NODE_NO_WARNINGS"] = "1"
-        self._gateway_process = subprocess.Popen(
-            ["openclaw", "gateway", "--dev", "--port", str(gateway_port), "--bind", "loopback"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
-        )
+        gw_env = _openclaw_cli_env({"NODE_NO_WARNINGS": "1"})
+        gw_log_path = os.path.join(_openclaw_state_dir(), "gateway.log")
+        with open(gw_log_path, "a", encoding="utf-8") as gw_log:
+            self._gateway_process = subprocess.Popen(
+                ["openclaw", "gateway", "--dev", "--port", str(gateway_port), "--bind", "loopback"],
+                stdout=gw_log, stderr=subprocess.STDOUT,
+                env=gw_env,
+            )
+
+        def _gw_log_tail() -> str:
+            try:
+                with open(gw_log_path, encoding="utf-8", errors="replace") as _lf:
+                    return _lf.read()[-800:].strip()
+            except OSError:
+                return ""
+
         # Wait for gateway to become healthy (max 30s)
         for attempt in range(15):
             await asyncio.sleep(2)
             if self._gateway_process.poll() is not None:
-                raise RuntimeError("OpenClaw gateway process exited")
+                tail = _gw_log_tail()
+                raise RuntimeError(
+                    f"OpenClaw gateway process exited (rc={self._gateway_process.returncode})"
+                    + (f": {tail}" if tail else "")
+                )
             try:
                 health = subprocess.run(
                     ["openclaw", "gateway", "health"],
                     capture_output=True, text=True, timeout=10,
-                    env=os.environ.copy()
+                    env=_openclaw_cli_env(),
                 )
                 if health.returncode == 0:
                     logger.info(f"OpenClaw gateway healthy (PID: {self._gateway_process.pid})")
@@ -922,7 +996,11 @@ class OpenClawAdapter(BaseAdapter):
             except subprocess.TimeoutExpired:
                 logger.debug(f"Gateway health check timeout (attempt {attempt+1}/15)")
         else:
-            raise RuntimeError("OpenClaw gateway did not become healthy within 30s")
+            tail = _gw_log_tail()
+            raise RuntimeError(
+                "OpenClaw gateway did not become healthy within 30s"
+                + (f": {tail}" if tail else "")
+            )
 
         # 6. Pre-approve operator scopes for the loopback CLI device.
         #
@@ -980,7 +1058,7 @@ class OpenClawAdapter(BaseAdapter):
         # pass the scope-upgrade gate cleanly. (User-visible chat
         # response then depends on the configured upstream model
         # credentials, which are unrelated to this template fix.)
-        OPENCLAW_DEVICES_DIR = os.path.expanduser("~/.openclaw/devices")
+        OPENCLAW_DEVICES_DIR = os.path.join(_openclaw_state_dir(), "devices")
         PAIRED_JSON = os.path.join(OPENCLAW_DEVICES_DIR, "paired.json")
         PENDING_JSON = os.path.join(OPENCLAW_DEVICES_DIR, "pending.json")
         # The full operator scope set openclaw 2026.5.6 recognises.
@@ -1093,7 +1171,7 @@ class OpenClawAdapter(BaseAdapter):
         except Exception:  # pragma: no cover — older base image without the producer
             return
 
-        oc_config_path = os.path.expanduser("~/.openclaw/openclaw.json")
+        oc_config_path = _openclaw_config_path()
         try:
             with open(oc_config_path) as _f:
                 servers = (json.load(_f).get("mcp") or {}).get("servers") or {}
@@ -1280,7 +1358,7 @@ class OpenClawAdapter(BaseAdapter):
             ["openclaw", "mcp", "set", "molecule",
              json.dumps({"type": "http", "url": mcp_url})],
             capture_output=True, text=True, timeout=30,
-            env=os.environ.copy(),
+            env=_openclaw_cli_env(),
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -1812,7 +1890,7 @@ class OpenClawA2AExecutor(SubprocessA2AExecutor):
                     "--json", "--timeout", "120",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    env={**os.environ, "PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}
+                    env=_openclaw_cli_env({"PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}),
                 )
                 # Renew the turn lease on every chunk of subprocess output
                 # (source D) so a genuinely-working long OpenClaw turn is not
@@ -1883,7 +1961,7 @@ class OpenClawA2AExecutor(SubprocessA2AExecutor):
                     # original error to the user, rather than failing
                     # silently.
                     try:
-                        _devices_dir = os.path.expanduser("~/.openclaw/devices")
+                        _devices_dir = os.path.join(_openclaw_state_dir(), "devices")
                         _paired_path = os.path.join(_devices_dir, "paired.json")
                         _pending_path = os.path.join(_devices_dir, "pending.json")
                         _scopes = sorted([
