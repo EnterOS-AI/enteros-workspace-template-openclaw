@@ -37,9 +37,15 @@ def test_user_owned_openclaw_root_keeps_default_dir(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
     oc = tmp_path / ".openclaw"
     oc.mkdir()
-    if hasattr(os, "geteuid"):
-        monkeypatch.setattr(os, "geteuid", lambda: 1000)
-        monkeypatch.setattr(os, "stat", lambda _p: SimpleNamespace(st_uid=1000, st_mode=0o40700))
+    real_stat = os.stat
+
+    def fake_stat(p, *args, **kwargs):
+        if Path(p) == oc:
+            return SimpleNamespace(st_uid=1000, st_mode=0o40700)
+        return real_stat(p, *args, **kwargs)
+
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(os, "stat", fake_stat)
 
     assert Path(adapter._openclaw_state_dir()) == oc
     assert Path(adapter._openclaw_config_path()) == oc / "openclaw.json"
