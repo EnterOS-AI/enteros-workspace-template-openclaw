@@ -294,15 +294,17 @@ jobs:
           fi
           echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
           # Offline k8s subPath smoke (internal#1333): simulate kubelet's 0:1000 02777 ~/.openclaw
-          # mount and prove adapter._openclaw_state_dir() isolates state into a 0700 subdir and
-          # `openclaw onboard --non-interactive` succeeds with native apiKey config (no legacy auth-profiles).
-          docker run --rm -i --network none --entrypoint /bin/bash "$SMOKE_TAG" <<'SMOKE_EOF'
+          # mount inside a 2Gi/2CPU envelope, prove adapter._openclaw_state_dir() isolates state into
+          # a 0700 subdir, adapter._ensure_safe_openclaw_logging() prevents the rolling-log ancestor crash,
+          # NODE_OPTIONS caps worker heap within 2Gi, gateway reaches /readyz 200, and 2x agent turns pass.
+          docker run --rm -i --network none --memory 2g --cpus 2 --entrypoint /bin/bash "$SMOKE_TAG" <<'SMOKE_EOF'
           set -euo pipefail
           mkdir -p /home/agent/.openclaw
           chown 0:1000 /home/agent/.openclaw
           chmod 2777 /home/agent/.openclaw
           gosu agent /bin/bash <<'AGENT_EOF'
           set -euo pipefail
+          export HOME=/home/agent
           STATE_DIR="$(PYTHONPATH=/app python3 -c '
           import adapter, os
           d = adapter._openclaw_state_dir()
@@ -312,6 +314,7 @@ jobs:
           print(d)
           ')"
           export OPENCLAW_STATE_DIR="$STATE_DIR"
+          export NODE_OPTIONS="$(PYTHONPATH=/app python3 -c 'import adapter; print(adapter._openclaw_cli_env()["NODE_OPTIONS"])')"
           openclaw onboard --non-interactive \
             --workspace /home/agent/.openclaw/workspace \
             --auth-choice custom-api-key \
@@ -321,16 +324,86 @@ jobs:
             --custom-compatibility openai \
             --secret-input-mode plaintext \
             --accept-risk --skip-health
-          python3 -c '
-          import json, os
+          PYTHONPATH=/app python3 -c '
+          import adapter, json, os
           sd = os.environ["OPENCLAW_STATE_DIR"]
-          cfg = json.load(open(os.path.join(sd, "openclaw.json")))
+          cfg_path = os.path.join(sd, "openclaw.json")
+          with open(cfg_path, encoding="utf-8") as f:
+              cfg = json.load(f)
+          assert adapter._ensure_safe_openclaw_logging(cfg, sd) is True
+          log_file = cfg["logging"]["file"]
+          assert not adapter._path_has_unsafe_ancestor(log_file), log_file
+          with open(cfg_path, "w", encoding="utf-8") as f:
+              json.dump(cfg, f, indent=2)
           assert cfg["gateway"]["mode"] == "local", cfg
           assert not os.path.exists(os.path.join(sd, "agents", "main", "agent", "auth-profiles.json"))
           '
+          python3 - <<'MOCK_EOF' &
+          import http.server, json
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  ln = int(self.headers.get("Content-Length", 0))
+                  _ = self.rfile.read(ln)
+                  resp = {
+                      "id": "chatcmpl-smoke",
+                      "object": "chat.completion",
+                      "created": 1700000000,
+                      "model": "google/gemini-4-hydrogen",
+                      "choices": [{"index": 0, "message": {"role": "assistant", "content": "51"}, "finish_reason": "stop"}],
+                      "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+                  }
+                  body = json.dumps(resp).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *a):
+                  pass
+          http.server.HTTPServer(("127.0.0.1", 19999), H).serve_forever()
+          MOCK_EOF
+          MOCK_PID=$!
+          GW_PID=""
+          cleanup_smoke() {
+            [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
+            kill "$MOCK_PID" 2>/dev/null || true
+          }
+          trap cleanup_smoke EXIT
+          openclaw gateway --dev --port 18789 --bind loopback >/tmp/gw-smoke.log 2>&1 &
+          GW_PID=$!
+          READY=0
+          for i in $(seq 1 45); do
+            sleep 1
+            if ! kill -0 "$GW_PID" 2>/dev/null; then
+              echo "::error::openclaw gateway exited during offline smoke"
+              cat /tmp/gw-smoke.log || true
+              exit 1
+            fi
+            st="$(PYTHONPATH=/app python3 -c 'import adapter; print(adapter._probe_gateway_ready(18789)[0])')"
+            if [ "$st" = "ready" ]; then
+              READY=1
+              echo "Gateway /readyz ready at t=${i}s"
+              break
+            fi
+          done
+          if [ "$READY" != "1" ]; then
+            echo "::error::openclaw gateway did not reach /readyz ready within 45s"
+            cat /tmp/gw-smoke.log || true
+            exit 1
+          fi
+          OUT1="$(openclaw agent --session-id ws-smoke-1 --message "Reply with 51" --json --timeout 30)"
+          OUT2="$(openclaw agent --session-id ws-smoke-1 --message "Reply with 51 again" --json --timeout 30)"
+          python3 -c '
+          import json, sys
+          for i, raw in enumerate(sys.argv[1:], 1):
+              d = json.loads(raw)
+              assert d.get("status") == "ok", f"turn {i} bad status: {raw[:400]}"
+              txt = d["result"]["payloads"][0]["text"]
+              assert txt == "51", f"turn {i} bad payload: {txt!r}"
+          ' "$OUT1" "$OUT2"
           AGENT_EOF
           SMOKE_EOF
-          echo "Offline Kubernetes 2777 subPath + openclaw onboard smoke PASS"
+          echo "Offline Kubernetes 2777 subPath + 2Gi/2CPU gateway /readyz + 2x openclaw agent smoke PASS"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
   # NOT a string-match. Builds the actual image, runs it under the EXACT
