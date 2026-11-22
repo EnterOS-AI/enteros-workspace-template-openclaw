@@ -216,15 +216,128 @@ def _openclaw_state_dir() -> str:
     return oc_root
 
 
+def _path_has_unsafe_ancestor(path: str) -> bool:
+    """Return True if path or any existing ancestor is group/world-writable without +t.
+
+    Mirrors OpenClaw 2026.11.6's ``assertSafeTempAncestors`` check so we detect
+    Kubernetes ``subPath`` mounts (``0:1000 02777``, no sticky bit) before the
+    gateway's default rolling logger crashes sidecar startup.
+    """
+    if os.name == "nt":
+        return False
+    cur = os.path.realpath(os.path.expanduser(path))
+    while True:
+        try:
+            st = os.lstat(cur)
+            if (st.st_mode & 0o022) != 0 and (st.st_mode & 0o1000) == 0:
+                return True
+        except OSError:
+            pass
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            return False
+        cur = parent
+
+
+def _openclaw_safe_log_file() -> str:
+    """Return a writable OpenClaw log file path with no unsafe ancestors."""
+    uid = os.geteuid() if hasattr(os, "geteuid") else None
+    candidates = [
+        os.path.expanduser("~/.cache/openclaw/logs"),
+        f"/tmp/openclaw-logs-{uid if uid is not None else 0}",
+    ]
+    for cand in candidates:
+        try:
+            os.makedirs(cand, mode=0o700, exist_ok=True)
+            if uid is None or os.stat(cand).st_uid == uid:
+                try:
+                    os.chmod(cand, 0o700)
+                except OSError:
+                    pass
+            if not _path_has_unsafe_ancestor(cand):
+                return os.path.join(cand, "openclaw.log")
+        except OSError:
+            continue
+    return "/tmp/openclaw.log"
+
+
+def _ensure_safe_openclaw_logging(oc_cfg: dict, state_dir: str) -> bool:
+    """Redirect ``logging.file`` away from state_dir when an ancestor is unsafe.
+
+    Keeping ``OPENCLAW_STATE_DIR`` on the PVC preserves auth/sessions/devices
+    across pod restarts while avoiding ``resolveDefaultRollingLogFile()``'s
+    ancestor check inside ~/.openclaw.
+    """
+    if not _path_has_unsafe_ancestor(state_dir):
+        return False
+    logging_cfg = oc_cfg.get("logging")
+    if isinstance(logging_cfg, dict):
+        existing = logging_cfg.get("file")
+        if isinstance(existing, str) and existing.strip():
+            expanded = os.path.expanduser(existing.strip())
+            if not _path_has_unsafe_ancestor(expanded):
+                log_dir = os.path.dirname(expanded)
+                if log_dir:
+                    try:
+                        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+                    except OSError:
+                        pass
+                return False
+    if not isinstance(logging_cfg, dict):
+        logging_cfg = {}
+        oc_cfg["logging"] = logging_cfg
+    logging_cfg["file"] = _openclaw_safe_log_file()
+    return True
+
+
+def _openclaw_node_options(existing: str = "") -> str:
+    """Cap V8 old-space and semi-space per worker isolate for 2 GiB pods."""
+    tokens = [tok for tok in (existing or "").split() if tok]
+    if not any(t == "--max-old-space-size" or t.startswith("--max-old-space-size=") for t in tokens):
+        tokens.append("--max-old-space-size=512")
+    if not any(t == "--max-semi-space-size" or t.startswith("--max-semi-space-size=") for t in tokens):
+        tokens.append("--max-semi-space-size=2")
+    return " ".join(tokens)
+
+
 def _openclaw_cli_env(extra: dict | None = None) -> dict:
-    """Build subprocess env with OPENCLAW_STATE_DIR set when redirected/configured."""
+    """Build subprocess env with OPENCLAW_STATE_DIR and tuned NODE_OPTIONS."""
     env = os.environ.copy()
     state_dir = _openclaw_state_dir()
     if state_dir != os.path.expanduser("~/.openclaw") or (env.get("OPENCLAW_STATE_DIR") or "").strip():
         env["OPENCLAW_STATE_DIR"] = state_dir
+    env["NODE_OPTIONS"] = _openclaw_node_options(env.get("NODE_OPTIONS", ""))
     if extra:
         env.update(extra)
     return env
+
+
+def _probe_gateway_ready(gateway_port: int, timeout: float = 5.0) -> tuple[str, str]:
+    """Poll OpenClaw gateway ``/readyz`` so startup sidecars are guaranteed ready."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    url = f"http://127.0.0.1:{int(gateway_port)}/readyz"
+    req = _urlreq.Request(url, method="GET")
+    try:
+        with _urlreq.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            try:
+                data = json.loads(body) if body else {}
+            except ValueError:
+                return "pending", body
+            if isinstance(data, dict) and (data.get("ready") is True or data.get("coreReady") is True):
+                return "ready", body
+            return "pending", body
+    except _urlerr.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace") if exc.fp else ""
+        if exc.code == 404:
+            return "unsupported", body
+        if exc.code == 503:
+            return "pending", body
+        return "unreachable", f"HTTP {exc.code}: {body[:200]}"
+    except Exception as exc:  # noqa: BLE001
+        return "unreachable", str(exc)
 
 
 def _openclaw_config_path() -> str:
@@ -773,15 +886,22 @@ class OpenClawAdapter(BaseAdapter):
                 host_part = provider_url.split("//", 1)[1].split("/", 1)[0]
                 provider_name = "custom-" + host_part.replace(".", "-").replace(":", "-")
                 providers = oc_cfg.get("models", {}).get("providers", {})
+                provider_updated = False
                 if provider_name in providers:
                     if api_key:
                         providers[provider_name]["apiKey"] = api_key
                     for m in providers[provider_name].get("models", []):
                         m["contextWindow"] = 1000000  # 1M tokens for modern models
                         m["maxTokens"] = 16384
+                    provider_updated = True
+                logging_updated = _ensure_safe_openclaw_logging(oc_cfg, state_dir)
+                if logging_updated:
+                    logger.info(f"Configured safe OpenClaw log file: {oc_cfg['logging']['file']}")
+                if provider_updated or logging_updated:
                     with open(oc_config_path, "w", encoding="utf-8") as _f:
                         json_mod.dump(oc_cfg, _f, indent=2)
-                    logger.info(f"Updated provider config for {provider_name}")
+                    if provider_updated:
+                        logger.info(f"Updated provider config for {provider_name}")
             except Exception as e:
                 logger.warning(f"Failed to update provider config in openclaw.json: {e}")
 
@@ -975,30 +1095,49 @@ class OpenClawAdapter(BaseAdapter):
             except OSError:
                 return ""
 
-        # Wait for gateway to become healthy (max 30s)
-        for attempt in range(15):
-            await asyncio.sleep(2)
+        # Wait for gateway sidecars and core RPC readiness on /readyz (max 45s)
+        last_status, last_detail = "unreachable", ""
+        for attempt in range(30):
+            await asyncio.sleep(1.5)
             if self._gateway_process.poll() is not None:
                 tail = _gw_log_tail()
+                logger.error(
+                    "OpenClaw gateway process exited (rc=%s): %s",
+                    self._gateway_process.returncode, tail,
+                )
                 raise RuntimeError(
                     f"OpenClaw gateway process exited (rc={self._gateway_process.returncode})"
                     + (f": {tail}" if tail else "")
                 )
-            try:
-                health = subprocess.run(
-                    ["openclaw", "gateway", "health"],
-                    capture_output=True, text=True, timeout=10,
-                    env=_openclaw_cli_env(),
+            last_status, last_detail = _probe_gateway_ready(gateway_port)
+            if last_status == "ready":
+                logger.info(f"OpenClaw gateway ready on /readyz (PID: {self._gateway_process.pid})")
+                break
+            if last_status == "unsupported":
+                try:
+                    health = subprocess.run(
+                        ["openclaw", "gateway", "health"],
+                        capture_output=True, text=True, timeout=10,
+                        env=_openclaw_cli_env(),
+                    )
+                    if health.returncode == 0:
+                        logger.info(f"OpenClaw gateway healthy (PID: {self._gateway_process.pid})")
+                        break
+                except subprocess.TimeoutExpired:
+                    logger.debug(f"Gateway health check timeout (attempt {attempt+1}/30)")
+            else:
+                logger.debug(
+                    "OpenClaw gateway waiting (%d/30, %s): %s",
+                    attempt + 1, last_status, last_detail[:200],
                 )
-                if health.returncode == 0:
-                    logger.info(f"OpenClaw gateway healthy (PID: {self._gateway_process.pid})")
-                    break
-            except subprocess.TimeoutExpired:
-                logger.debug(f"Gateway health check timeout (attempt {attempt+1}/15)")
         else:
             tail = _gw_log_tail()
+            logger.error(
+                "OpenClaw gateway did not become ready within 45s (%s: %s): %s",
+                last_status, last_detail[:200], tail,
+            )
             raise RuntimeError(
-                "OpenClaw gateway did not become healthy within 30s"
+                f"OpenClaw gateway did not become ready within 45s ({last_status})"
                 + (f": {tail}" if tail else "")
             )
 
@@ -1945,6 +2084,10 @@ class OpenClawA2AExecutor(SubprocessA2AExecutor):
                 # first. Match on either the structured code or the
                 # human-readable banner so we catch both shapes.
                 combined = (output + "\n" + stderr_text).lower()
+                if "agent unavailable during gateway startup" in combined and attempt == 0:
+                    logger.info("openclaw gateway still finishing startup sidecars; waiting 2s and retrying agent call")
+                    await asyncio.sleep(2)
+                    continue
                 is_pairing_error = (
                     "scope upgrade pending approval" in combined
                     or "pairing required" in combined
