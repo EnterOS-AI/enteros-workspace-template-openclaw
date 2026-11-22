@@ -74,7 +74,19 @@ REQUIRED_TOOLS: dict[str, list[str]] = {
 
 
 def default_openclaw_json() -> Path:
-    return Path(os.path.expanduser("~/.openclaw/openclaw.json"))
+    override = (os.environ.get("OPENCLAW_STATE_DIR") or "").strip()
+    if override:
+        return Path(os.path.expanduser(override)) / "openclaw.json"
+    oc_root = Path(os.path.expanduser("~/.openclaw"))
+    if hasattr(os, "geteuid") and oc_root.is_dir():
+        try:
+            if os.stat(oc_root).st_uid != os.geteuid():
+                state_cfg = oc_root / "state" / "openclaw.json"
+                if state_cfg.exists() or (oc_root / "state").is_dir():
+                    return state_cfg
+        except OSError:
+            pass
+    return oc_root / "openclaw.json"
 
 
 def read_declared_servers(openclaw_json: Path) -> dict:
