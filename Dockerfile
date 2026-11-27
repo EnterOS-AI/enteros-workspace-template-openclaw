@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # sha could differ. The daily upstream-sync workflow watches the npm registry
 # and opens a bump PR here when a newer release ships — upgrades become
 # explicit, reviewable commits that also trigger the rebuild.
-ARG OPENCLAW_VERSION=2026.11.6
+ARG OPENCLAW_VERSION=2026.11.10
 RUN npm install -g "openclaw@${OPENCLAW_VERSION}" \
     && openclaw --version
 
